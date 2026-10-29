@@ -14,7 +14,7 @@ import {
 } from "@executor-js/execution";
 import {
   PAUSED_APPROVAL_TIMEOUT_MS,
-  PAUSE_NOT_RECORDED_RESPONSE,
+  declineUnrecordedPause,
   formatMcpExecutionOutcome,
   pauseNotRecordedResult,
   type BrowserApprovalDecision,
@@ -126,6 +126,8 @@ type PendingApprovalLease = {
   readonly deadline: PausedExecutionDeadline | undefined;
   readonly expiresAtMs: number;
   timeout: ReturnType<typeof setTimeout> | null;
+  /** A resume is running; the deadline no longer applies. */
+  resuming: boolean;
   expiring: boolean;
 };
 
@@ -1749,17 +1751,16 @@ export abstract class McpAgentSessionDOBase<
           const nextId = outcome.execution.id;
           const recorded = yield* Effect.exit(self.startPendingApprovalLease(nextId, deadline));
           if (Exit.isFailure(recorded)) {
-            // Never report a pause no other session can find; cancel it.
-            const engine = self.engine;
-            if (engine) {
-              yield* engine
-                .resume(nextId, PAUSE_NOT_RECORDED_RESPONSE)
-                .pipe(
+            // Never report a pause no other session can find; decline it.
+            const stillPaused = self.engine
+              ? yield* declineUnrecordedPause(self.engine, nextId).pipe(
                   Effect.provideService(CurrentOrgWriteAccess, makeOrgWriteAccessState("denied")),
-                  Effect.ignore,
-                );
-            }
-            return { status: "result" as const, result: pauseNotRecordedResult(nextId) };
+                )
+              : null;
+            return {
+              status: "result" as const,
+              result: pauseNotRecordedResult(nextId, stillPaused),
+            };
           }
           return {
             status: "result" as const,
@@ -1851,21 +1852,24 @@ export abstract class McpAgentSessionDOBase<
     // for the SDK heartbeat this path skips, so the isolate stays resident.
     // Overdue leases are expired here too, so a lost in-isolate timer cannot
     // hold the session open past its approval window.
+    // Only leases still waiting on an answer have a deadline: one being
+    // resumed must settle, and one being expired is already handled.
     if (await this.destroyPending()) {
+      const waiting = () =>
+        Array.from(this.pendingApprovalLeases).filter(
+          ([, lease]) => !lease.resuming && !lease.expiring,
+        );
       const now = Date.now();
-      const overdue = Array.from(this.pendingApprovalLeases)
+      const overdue = waiting()
         .filter(([, lease]) => lease.expiresAtMs <= now)
         .map(([executionId]) => executionId);
       await Effect.runPromise(
         Effect.forEach(overdue, (executionId) => this.expirePendingApprovalReported(executionId)),
       );
       if (this.pendingApprovalLeases.size > 0) {
-        const nextExpiryMs = Math.min(
-          ...Array.from(this.pendingApprovalLeases.values(), (lease) => lease.expiresAtMs),
-        );
-        await this.ctx.storage.setAlarm(
-          Math.min(Date.now() + CLOSED_SESSION_LEASE_RECHECK_MS, nextExpiryMs),
-        );
+        const recheckMs = Date.now() + CLOSED_SESSION_LEASE_RECHECK_MS;
+        const nextExpiryMs = Math.min(recheckMs, ...waiting().map(([, l]) => l.expiresAtMs));
+        await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, nextExpiryMs));
         return;
       }
       await super.alarm();
@@ -2095,7 +2099,9 @@ export abstract class McpAgentSessionDOBase<
                 owner: record.owner,
                 cause,
               });
-              return { status: "execution_expired" as const, ttlMs: record.ttlMs };
+              // The failure may have come after the owner ran the call, so
+              // treat it like a timeout: keep the record, let the caller retry.
+              return { status: "execution_in_progress" as const };
             }),
           ),
         );
@@ -2139,6 +2145,7 @@ export abstract class McpAgentSessionDOBase<
         deadline,
         expiresAtMs: Date.now() + PAUSED_APPROVAL_TIMEOUT_MS,
         timeout,
+        resuming: false,
         expiring: false,
       });
       yield* self
@@ -2186,6 +2193,7 @@ export abstract class McpAgentSessionDOBase<
       if (!lease || lease.expiring) return;
       if (lease.timeout) clearTimeout(lease.timeout);
       lease.timeout = null;
+      lease.resuming = true;
     }).pipe(
       Effect.withSpan("McpSessionDO.pending_approval_lease.begin_resume", {
         attributes: { "mcp.execution.id": executionId },
@@ -2196,8 +2204,10 @@ export abstract class McpAgentSessionDOBase<
   private finishPendingApprovalResume(executionId: string): Effect.Effect<void> {
     const self = this;
     return Effect.gen(function* () {
+      const lease = self.pendingApprovalLeases.get(executionId);
+      if (lease) lease.resuming = false;
       const settled =
-        self.pendingApprovalLeases.has(executionId) && self.engine?.isExecutionSettled
+        lease && self.engine?.isExecutionSettled
           ? yield* self.engine.isExecutionSettled(executionId)
           : false;
       yield* self.releasePendingApprovalLease(executionId, settled ? "settled" : undefined);
@@ -2267,28 +2277,31 @@ export abstract class McpAgentSessionDOBase<
     return Effect.gen(function* () {
       yield* self.prepareErrorCaptureScope();
       const lease = self.pendingApprovalLeases.get(executionId);
-      if (!lease || lease.expiring) return;
+      // Not ours to end: gone, already expiring, being resumed, or answered
+      // by the browser (the waiting call resumes with that answer).
+      if (!lease || lease.expiring || lease.resuming) return;
+      if (self.approvalResponses.has(executionId)) return;
       lease.expiring = true;
       if (lease.timeout) clearTimeout(lease.timeout);
       lease.timeout = null;
-      if (self.approvalResponses.has(executionId)) return;
 
       const response = {
         action: "decline",
         content: { reason: "approval_timeout" },
       } satisfies ResumeResponse;
-      yield* Effect.sync(() => {
-        console.info(JSON.stringify({ event: "mcp_pending_approval_lease_expire", executionId }));
-      });
-      yield* self.recordApprovalResponse(executionId, {
-        response,
-        orgWriteAccess: "denied",
-      });
-      if (self.engine && !self.approvalWaiters.has(executionId)) {
-        yield* self.engine.resume(executionId, response).pipe(Effect.ignore);
-      }
+      yield* Effect.gen(function* () {
+        yield* Effect.sync(() => {
+          console.info(JSON.stringify({ event: "mcp_pending_approval_lease_expire", executionId }));
+        });
+        yield* self.recordApprovalResponse(executionId, {
+          response,
+          orgWriteAccess: "denied",
+        });
+        if (self.engine && !self.approvalWaiters.has(executionId)) {
+          yield* self.engine.resume(executionId, response).pipe(Effect.ignore);
+        }
+      }).pipe(Effect.ensuring(self.releasePendingApprovalLease(executionId, "expired")));
     }).pipe(
-      Effect.ensuring(self.releasePendingApprovalLease(executionId, "expired")),
       Effect.withSpan("McpSessionDO.pending_approval_lease.expire", {
         attributes: { "mcp.execution.id": executionId },
       }),

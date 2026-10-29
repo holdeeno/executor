@@ -790,6 +790,26 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     });
   });
 
+  it("answers a failed owner session forward as in progress and keeps the record", async () => {
+    const { directory, namespace } = makeDirectory();
+    const sessionB = new HarnessSession({
+      sessionId: "session-b",
+      engine: makeEngine(() => null).engine,
+      directoryNamespace: namespace,
+      forwardModelResumeToOwner: () => Effect.fail("owner unreachable"),
+    });
+    await sessionB.storeSessionMeta();
+    await putOwnerRecord(directory, { executionId: "exec_throw" });
+
+    const outcome = await sessionB.resumeViaModelTool("exec_throw", approval);
+
+    // The owner may have run the call before the failure reached us.
+    expect(outcome).toEqual({ status: "execution_in_progress" });
+    expect(await Effect.runPromise(directory.get("exec_throw"))).toMatchObject({
+      executionId: "exec_throw",
+    });
+  });
+
   describe("after the client DELETEs the owning session", () => {
     const setup = async (resumeMs = 0) => {
       const { directory, namespace } = makeDirectory();
@@ -880,6 +900,47 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
 
       expect(retry).toEqual({ status: "execution_already_settled" });
       expect(owner.sideEffects()).toBe(1);
+    });
+
+    it("lets a resume that runs past the deadline settle, not expire", async () => {
+      const { directory, owner, sessionA, sessionB, newSession } = await setup(5 * 60 * 1000);
+
+      const first = sessionB.resumeViaModelTool("exec_owner", approval);
+      // Keep the closed session's alarm running while the resumed call runs
+      // well past the 4-minute pause deadline.
+      for (let elapsed = 0; elapsed < 5 * 60 * 1000; elapsed += 30_000) {
+        await vi.advanceTimersByTimeAsync(30_000);
+        await sessionA.fireDueAlarm();
+      }
+      await vi.advanceTimersByTimeAsync(30_000);
+      await sessionA.fireDueAlarm();
+
+      expect(await first).toEqual({ status: "execution_in_progress" });
+      expect(await Effect.runPromise(directory.get("exec_owner"))).toMatchObject({
+        outcome: "settled",
+      });
+      const sessionC = newSession("session-c");
+      await sessionC.storeSessionMeta();
+      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toEqual({
+        status: "execution_already_settled",
+      });
+      expect(owner.sideEffects()).toBe(1);
+    });
+
+    it("answers late retries as settled for 15 minutes, then forgets the run", async () => {
+      const { sessionA, sessionB, newSession } = await setup();
+      await sessionB.resumeViaModelTool("exec_owner", approval);
+      await sessionA.fireDueAlarm();
+      const sessionC = newSession("session-c");
+      await sessionC.storeSessionMeta();
+
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000 - 1);
+      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toEqual({
+        status: "execution_already_settled",
+      });
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toBeNull();
     });
 
     it("expires an overdue lease from the alarm when its timer never fired", async () => {

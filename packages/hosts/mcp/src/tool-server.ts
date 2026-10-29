@@ -910,23 +910,65 @@ const resumeUnavailableResult = (input: {
 
 /** Declines a pause the host could not record, the way an expired approval is
  * declined, so the paused call never runs. */
-export const PAUSE_NOT_RECORDED_RESPONSE = {
+const PAUSE_NOT_RECORDED_RESPONSE = {
   action: "decline",
   content: { reason: "pause_not_recorded" },
 } satisfies ResumeResponse;
 
-export const pauseNotRecordedResult = (executionId: string): McpToolResult => ({
+const MAX_UNRECORDED_PAUSE_DECLINES = 3;
+
+/**
+ * Decline a pause the host could not record. Declining lets the code go on,
+ * and it may reach another approval; that pause cannot be recorded either, so
+ * it is declined too, a bounded number of times. Returns the id still paused
+ * when the bound is hit, else null.
+ */
+export const declineUnrecordedPause = <E extends Cause.YieldableError>(
+  engine: Pick<ExecutionEngine<E>, "resume">,
+  executionId: string,
+): Effect.Effect<string | null> =>
+  Effect.gen(function* () {
+    let pausedId = executionId;
+    for (let attempt = 0; attempt < MAX_UNRECORDED_PAUSE_DECLINES; attempt++) {
+      const outcome = yield* engine
+        .resume(pausedId, PAUSE_NOT_RECORDED_RESPONSE)
+        .pipe(Effect.catchCause(() => Effect.succeed(null)));
+      if (outcome?.status !== "paused") return null;
+      pausedId = outcome.execution.id;
+    }
+    console.error(
+      JSON.stringify({
+        event: "mcp_unrecorded_pause_decline_limit",
+        executionId,
+        stillPausedExecutionId: pausedId,
+      }),
+    );
+    return pausedId;
+  });
+
+export const pauseNotRecordedResult = (
+  executionId: string,
+  stillPausedExecutionId: string | null,
+): McpToolResult => ({
   content: [
     {
       type: "text" as const,
       text: [
         `The call paused for approval, but the pause could not be saved: ${executionId}.`,
-        "It was canceled and the paused call did not run.",
-        recoveryText,
+        "The approval was declined; later steps may have run.",
+        ...(stillPausedExecutionId
+          ? [`It then reached another approval that is still pending: ${stillPausedExecutionId}.`]
+          : []),
+        "Check what already ran before running execute again.",
       ].join(" "),
     },
   ],
-  structuredContent: { status: "pause_not_recorded", executionId, recovery: "re_execute" },
+  structuredContent: {
+    status: "pause_not_recorded",
+    executionId,
+    recovery: "re_execute",
+    ...(stillPausedExecutionId ? { stillPausedExecutionId } : {}),
+  },
   isError: true,
 });
 
@@ -1620,9 +1662,9 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
       (config.pausedExecutionHooks?.onExecutionPaused?.(executionId, deadline) ?? Effect.void).pipe(
         Effect.as(null),
         Effect.catchCause(() =>
-          engine
-            .resume(executionId, PAUSE_NOT_RECORDED_RESPONSE)
-            .pipe(Effect.ignore, Effect.as(pauseNotRecordedResult(executionId))),
+          declineUnrecordedPause(engine, executionId).pipe(
+            Effect.map((stillPaused) => pauseNotRecordedResult(executionId, stillPaused)),
+          ),
         ),
       );
     const onResumeStarted = (executionId: string): Effect.Effect<void> =>
