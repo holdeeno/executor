@@ -1400,6 +1400,40 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
     );
   });
 
+  it("cancels a pause the host could not record instead of reporting it", async () => {
+    const resumes: Array<{ executionId: string; action: string }> = [];
+    const approval = FormElicitation.make({ message: "Approve", requestedSchema: {} });
+    const engine = makeStubEngine({
+      executeWithPause: () => Effect.succeed(makePausedResult("exec_1", approval)),
+      resume: (executionId, response) =>
+        Effect.sync(() => {
+          resumes.push({ executionId, action: response.action });
+          return { status: "completed", result: { result: "declined" } };
+        }),
+    });
+
+    await withClient(
+      engine,
+      NO_CAPS,
+      async (client) => {
+        const result = await client.callTool({ name: "execute", arguments: { code: "pause" } });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          status: "pause_not_recorded",
+          executionId: "exec_1",
+        });
+        expect(resumes).toEqual([{ executionId: "exec_1", action: "decline" }]);
+      },
+      {
+        elicitationMode: { mode: "model" },
+        pausedExecutionHooks: {
+          onExecutionPaused: () => Effect.fail("directory unavailable"),
+        },
+      },
+    );
+  });
+
   it("resume tool passes parsed content to engine", async () => {
     let receivedContent: Record<string, unknown> | undefined;
     const engine = makeStubEngine({

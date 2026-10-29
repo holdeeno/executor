@@ -1,4 +1,4 @@
-import { Cause, Deferred, Effect, Exit, Option, Schema } from "effect";
+import { Cause, Data, Deferred, Effect, Exit, Option, Schema } from "effect";
 import type * as Tracer from "effect/Tracer";
 import type { Connection, ConnectionContext } from "agents";
 import { McpAgent } from "agents/mcp";
@@ -14,7 +14,9 @@ import {
 } from "@executor-js/execution";
 import {
   PAUSED_APPROVAL_TIMEOUT_MS,
+  PAUSE_NOT_RECORDED_RESPONSE,
   formatMcpExecutionOutcome,
+  pauseNotRecordedResult,
   type BrowserApprovalDecision,
   type PausedExecutionHooks,
   type ResumeFallbackOutcome,
@@ -33,6 +35,7 @@ import type { IncomingPropagationHeaders, McpElicitationMode } from "./do-header
 import { classifyDurableObjectError, type DurableObjectFailure } from "./durable-object-errors";
 import type {
   McpExecutionOwnerDirectory,
+  McpExecutionOwnerOutcome,
   McpExecutionOwnerRecord,
   McpExecutionOwnerRoute,
 } from "./execution-owner-directory";
@@ -121,6 +124,7 @@ type McpSessionApprovalErrorResult =
 type PendingApprovalLease = {
   readonly disposeKeepAlive: () => void;
   readonly deadline: PausedExecutionDeadline | undefined;
+  readonly expiresAtMs: number;
   timeout: ReturnType<typeof setTimeout> | null;
   expiring: boolean;
 };
@@ -224,12 +228,16 @@ const CLOSED_SESSION_LEASE_RECHECK_MS = 30_000;
 const MCP_HTTP_METHOD_HEADER = "cf-mcp-method";
 const MCP_MESSAGE_HEADER = "cf-mcp-message";
 const MODEL_RESUME_FORWARD_TIMEOUT_MS = 10_000;
+/** How long an ended pause's owner record answers late resumes. */
+const ENDED_OWNER_RECORD_TTL_MS = 15 * 60 * 1000;
 const approvalResponseKey = (executionId: string) => `approval-response:${executionId}`;
 const BrowserApprovalDecisionStorage = Schema.Struct({
   response: ElicitationResponse,
   orgWriteAccess: Schema.Literals(["allowed", "denied"]),
 });
 const decodeBrowserApprovalDecision = Schema.decodeUnknownOption(BrowserApprovalDecisionStorage);
+
+class McpSessionMetaMissingError extends Data.TaggedError("McpSessionMetaMissingError")<{}> {}
 
 type JsonRpcRequestId = string | number;
 const JsonRpcRequestWithId = Schema.Struct({
@@ -1730,15 +1738,29 @@ export abstract class McpAgentSessionDOBase<
           const alreadySettled = self.engine.isExecutionSettled
             ? yield* self.engine.isExecutionSettled(executionId)
             : false;
+          // A settled run's record is what answers later retries; keep it.
+          if (alreadySettled) return { status: "execution_already_settled" } as const;
           yield* self.deleteExecutionOwnerEntry(executionId);
-          return alreadySettled
-            ? ({ status: "execution_already_settled" } as const)
-            : ({ status: "execution_expired", ttlMs: PAUSED_APPROVAL_TIMEOUT_MS } as const);
+          return { status: "execution_expired", ttlMs: PAUSED_APPROVAL_TIMEOUT_MS } as const;
         }
 
         if (outcome.status === "paused") {
           const deadline = self.approvalDeadline();
-          yield* self.startPendingApprovalLease(outcome.execution.id, deadline);
+          const nextId = outcome.execution.id;
+          const recorded = yield* Effect.exit(self.startPendingApprovalLease(nextId, deadline));
+          if (Exit.isFailure(recorded)) {
+            // Never report a pause no other session can find; cancel it.
+            const engine = self.engine;
+            if (engine) {
+              yield* engine
+                .resume(nextId, PAUSE_NOT_RECORDED_RESPONSE)
+                .pipe(
+                  Effect.provideService(CurrentOrgWriteAccess, makeOrgWriteAccessState("denied")),
+                  Effect.ignore,
+                );
+            }
+            return { status: "result" as const, result: pauseNotRecordedResult(nextId) };
+          }
           return {
             status: "result" as const,
             result: formatMcpExecutionOutcome(outcome, { pausedDeadline: deadline }),
@@ -1827,9 +1849,23 @@ export abstract class McpAgentSessionDOBase<
     // the lease is resumed or expires: releasing its keep-alive re-arms this
     // alarm for now, and the destroy then runs. The short re-check stands in
     // for the SDK heartbeat this path skips, so the isolate stays resident.
+    // Overdue leases are expired here too, so a lost in-isolate timer cannot
+    // hold the session open past its approval window.
     if (await this.destroyPending()) {
+      const now = Date.now();
+      const overdue = Array.from(this.pendingApprovalLeases)
+        .filter(([, lease]) => lease.expiresAtMs <= now)
+        .map(([executionId]) => executionId);
+      await Effect.runPromise(
+        Effect.forEach(overdue, (executionId) => this.expirePendingApprovalReported(executionId)),
+      );
       if (this.pendingApprovalLeases.size > 0) {
-        await this.ctx.storage.setAlarm(Date.now() + CLOSED_SESSION_LEASE_RECHECK_MS);
+        const nextExpiryMs = Math.min(
+          ...Array.from(this.pendingApprovalLeases.values(), (lease) => lease.expiresAtMs),
+        );
+        await this.ctx.storage.setAlarm(
+          Math.min(Date.now() + CLOSED_SESSION_LEASE_RECHECK_MS, nextExpiryMs),
+        );
         return;
       }
       await super.alarm();
@@ -1938,22 +1974,26 @@ export abstract class McpAgentSessionDOBase<
   private writeExecutionOwnerEntry(
     executionId: string,
     deadline: PausedExecutionDeadline | undefined,
-    settled = false,
-  ): Effect.Effect<void> {
+    outcome?: McpExecutionOwnerOutcome,
+  ): Effect.Effect<void, unknown> {
     const directory = this.executionOwnerDirectory();
     if (!directory || !deadline) return Effect.void;
     const self = this;
     return Effect.gen(function* () {
       const sessionMeta = yield* self.loadSessionMeta();
-      if (!sessionMeta) return;
+      if (!sessionMeta) return yield* new McpSessionMetaMissingError();
       const record: McpExecutionOwnerRecord = {
         executionId,
         owner: self.executionOwnerRoute(),
         accountId: sessionMeta.userId,
         organizationId: sessionMeta.organizationId,
-        expiresAt: deadline.expiresAt,
+        ...(outcome
+          ? {
+              outcome,
+              expiresAt: new Date(Date.now() + ENDED_OWNER_RECORD_TTL_MS).toISOString(),
+            }
+          : { expiresAt: deadline.expiresAt }),
         ttlMs: deadline.ttlMs,
-        ...(settled ? { settled: true as const } : {}),
       };
       yield* directory
         .put(record)
@@ -1962,7 +2002,7 @@ export abstract class McpAgentSessionDOBase<
             self.logExecutionOwnerDirectoryFailure({ operation: "put", executionId, cause }),
           ),
         );
-    }).pipe(Effect.ignore);
+    });
   }
 
   private deleteExecutionOwnerEntry(executionId: string): Effect.Effect<void> {
@@ -2019,9 +2059,12 @@ export abstract class McpAgentSessionDOBase<
         return { status: "execution_forbidden" } as const;
       }
 
-      // The owner already resumed this execution (and may since have been
-      // destroyed). Answer the retry; never run the paused call twice.
-      if (record.settled) return { status: "execution_already_settled" } as const;
+      // The pause already ended (and the owner may since have been destroyed).
+      // Answer the retry; never run the paused call twice.
+      if (record.outcome === "settled") return { status: "execution_already_settled" } as const;
+      if (record.outcome === "expired") {
+        return { status: "execution_expired", ttlMs: record.ttlMs } as const;
+      }
 
       if (self.sameExecutionOwnerRoute(record.owner, self.executionOwnerRoute())) {
         yield* self.deleteExecutionOwnerEntry(executionId);
@@ -2033,6 +2076,8 @@ export abstract class McpAgentSessionDOBase<
         .pipe(
           Effect.timeoutOrElse({
             duration: `${MODEL_RESUME_FORWARD_TIMEOUT_MS} millis`,
+            // The owner may still be running the resumed call, so this is not
+            // an expiry: keep the record and let the caller resume again.
             orElse: () =>
               Effect.gen(function* () {
                 yield* self.logModelResumeForwardTimeout({
@@ -2040,7 +2085,7 @@ export abstract class McpAgentSessionDOBase<
                   owner: record.owner,
                   timeoutMs: MODEL_RESUME_FORWARD_TIMEOUT_MS,
                 });
-                return { status: "execution_expired" as const, ttlMs: record.ttlMs };
+                return { status: "execution_in_progress" as const };
               }),
           }),
           Effect.catchCause((cause) =>
@@ -2063,10 +2108,15 @@ export abstract class McpAgentSessionDOBase<
     });
   }
 
+  /**
+   * Fails when the owner directory entry cannot be written, even after one
+   * retry: without it no other session can find the pause, so the caller must
+   * cancel it rather than report it. The lease is released on any failure.
+   */
   private startPendingApprovalLease(
     executionId: string,
     deadline: PausedExecutionDeadline | undefined,
-  ): Effect.Effect<void> {
+  ): Effect.Effect<void, unknown> {
     const self = this;
     return Effect.gen(function* () {
       yield* self.prepareErrorCaptureScope();
@@ -2081,20 +2131,22 @@ export abstract class McpAgentSessionDOBase<
       // which used to hold a ref across the pause and mask this by keeping
       // the ref transition away from 0->1.)
       const disposeKeepAlive = yield* Effect.promise(() => self.keepAlive());
-      yield* self
-        .bestEffortBookkeeping("approval_lease.mark_activity", () => self.markActivity())
-        .pipe(Effect.withSpan("McpSessionDO.markActivity"));
       const timeout = setTimeout(() => {
         self.queuePendingApprovalLeaseExpiration(executionId);
       }, PAUSED_APPROVAL_TIMEOUT_MS);
       self.pendingApprovalLeases.set(executionId, {
         disposeKeepAlive,
         deadline,
+        expiresAtMs: Date.now() + PAUSED_APPROVAL_TIMEOUT_MS,
         timeout,
         expiring: false,
       });
-      yield* self.writeExecutionOwnerEntry(executionId, deadline);
+      yield* self
+        .bestEffortBookkeeping("approval_lease.mark_activity", () => self.markActivity())
+        .pipe(Effect.withSpan("McpSessionDO.markActivity"));
+      yield* self.writeExecutionOwnerEntry(executionId, deadline).pipe(Effect.retry({ times: 1 }));
     }).pipe(
+      Effect.onError(() => self.releasePendingApprovalLease(executionId)),
       Effect.withSpan("McpSessionDO.pending_approval_lease.start", {
         attributes: { "mcp.execution.id": executionId },
       }),
@@ -2106,26 +2158,25 @@ export abstract class McpAgentSessionDOBase<
           yield* self.captureCauseEffect(cause);
         }),
       ),
-      Effect.ignore,
     );
   }
 
   private queuePendingApprovalLeaseExpiration(executionId: string): void {
+    this.ctx.waitUntil(Effect.runPromise(this.expirePendingApprovalReported(executionId)));
+  }
+
+  private expirePendingApprovalReported(executionId: string): Effect.Effect<void> {
     const self = this;
-    this.ctx.waitUntil(
-      Effect.runPromise(
-        this.expirePendingApproval(executionId).pipe(
-          Effect.tapCause((cause) =>
-            Effect.gen(function* () {
-              yield* Effect.sync(() => {
-                console.error("[mcp-session] pending approval lease expiration failed");
-              });
-              yield* self.captureCauseEffect(cause);
-            }),
-          ),
-          Effect.ignore,
-        ),
+    return this.expirePendingApproval(executionId).pipe(
+      Effect.tapCause((cause) =>
+        Effect.gen(function* () {
+          yield* Effect.sync(() => {
+            console.error("[mcp-session] pending approval lease expiration failed");
+          });
+          yield* self.captureCauseEffect(cause);
+        }),
       ),
+      Effect.ignore,
     );
   }
 
@@ -2149,7 +2200,7 @@ export abstract class McpAgentSessionDOBase<
         self.pendingApprovalLeases.has(executionId) && self.engine?.isExecutionSettled
           ? yield* self.engine.isExecutionSettled(executionId)
           : false;
-      yield* self.releasePendingApprovalLease(executionId, settled);
+      yield* self.releasePendingApprovalLease(executionId, settled ? "settled" : undefined);
     }).pipe(
       Effect.withSpan("McpSessionDO.pending_approval_lease.finish", {
         attributes: { "mcp.execution.id": executionId },
@@ -2158,19 +2209,22 @@ export abstract class McpAgentSessionDOBase<
   }
 
   /**
-   * `settled` keeps the owner directory record, marked settled, instead of
-   * deleting it. The directory is written before the keep-alive goes: dropping
-   * the last one lets a DELETE-deferred destroy run.
+   * With an `outcome`, the owner directory record is kept and marked with it
+   * instead of deleted. The directory is written before the keep-alive goes:
+   * dropping the last one lets a DELETE-deferred destroy run.
    */
-  private releasePendingApprovalLease(executionId: string, settled = false): Effect.Effect<void> {
+  private releasePendingApprovalLease(
+    executionId: string,
+    outcome?: McpExecutionOwnerOutcome,
+  ): Effect.Effect<void> {
     const self = this;
     return Effect.gen(function* () {
       const lease = self.pendingApprovalLeases.get(executionId);
       if (!lease) return;
       if (lease.timeout) clearTimeout(lease.timeout);
       self.pendingApprovalLeases.delete(executionId);
-      yield* settled
-        ? self.writeExecutionOwnerEntry(executionId, lease.deadline, true)
+      yield* outcome
+        ? self.writeExecutionOwnerEntry(executionId, lease.deadline, outcome).pipe(Effect.ignore)
         : self.deleteExecutionOwnerEntry(executionId);
       lease.disposeKeepAlive();
     });
@@ -2234,7 +2288,7 @@ export abstract class McpAgentSessionDOBase<
         yield* self.engine.resume(executionId, response).pipe(Effect.ignore);
       }
     }).pipe(
-      Effect.ensuring(self.releasePendingApprovalLease(executionId)),
+      Effect.ensuring(self.releasePendingApprovalLease(executionId, "expired")),
       Effect.withSpan("McpSessionDO.pending_approval_lease.expire", {
         attributes: { "mcp.execution.id": executionId },
       }),

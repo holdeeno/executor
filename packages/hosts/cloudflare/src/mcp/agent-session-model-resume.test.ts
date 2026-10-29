@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "@effect/vitest";
 // oxlint-disable-next-line executor/no-vitest-import -- boundary: vi.mock must come from vitest itself for mock hoisting to resolve
 import { vi } from "vitest";
-import { Cause, Effect } from "effect";
+import { Cause, Effect, Exit } from "effect";
 import {
   CurrentOrgWriteAccess,
   currentOrgWriteAccess,
@@ -295,20 +295,33 @@ const makeEngine = (
 };
 
 /** An engine holding one live pause, like the real one: resuming runs the
- * paused tool call once, and the id is then remembered as settled. */
-const makePausingEngine = (executionId: string) => {
+ * paused tool call once, a resume that lands while it runs joins it, and the
+ * id is then remembered as settled. `resumeMs` is how long the call runs. */
+const makePausingEngine = (executionId: string, resumeMs = 0) => {
   const paused = new Set([executionId]);
   const settled = new Set<string>();
+  const running = new Map<string, Promise<ExecutionResult>>();
   let sideEffects = 0;
   const { engine } = makeEngine(() => null);
   const pausingEngine: ExecutionEngine<Cause.YieldableError> = {
     ...engine,
     resume: (id) =>
-      Effect.sync(() => {
+      Effect.promise(async () => {
+        const joined = running.get(id);
+        if (joined) return joined;
         if (!paused.delete(id)) return null;
         sideEffects += 1;
-        settled.add(id);
-        return completed("owner-result");
+        const run = new Promise<ExecutionResult>((resolve) => {
+          const finish = () => {
+            settled.add(id);
+            running.delete(id);
+            resolve(completed("owner-result"));
+          };
+          if (resumeMs === 0) finish();
+          else setTimeout(finish, resumeMs);
+        });
+        running.set(id, run);
+        return run;
       }),
     pausedExecutionCount: () => Effect.sync(() => paused.size),
     hasPausedExecutions: () => Effect.sync(() => paused.size > 0),
@@ -717,7 +730,39 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     });
   });
 
-  it("times out a wedged owner session forward as execution_expired", async () => {
+  it("fails the pause, holding no lease, when the owner record cannot be written", async () => {
+    let putAttempts = 0;
+    const unwritableDirectory: McpExecutionOwnerDirectoryNamespace<string> = {
+      idFromName: (name) => name,
+      get: () => ({
+        put: () => {
+          putAttempts += 1;
+          return Effect.runPromise(Effect.fail("directory unavailable"));
+        },
+        get: () => Promise.resolve(null),
+        delete: () => Promise.resolve(),
+      }),
+    };
+    const sessionA = new HarnessSession({
+      sessionId: "session-a",
+      engine: makeEngine(() => null).engine,
+      directoryNamespace: unwritableDirectory,
+    });
+    await sessionA.storeSessionMeta();
+
+    const pausing = Effect.runPromiseExit(
+      Effect.tryPromise(() => sessionA.startPause("exec_unrecorded")),
+    );
+    // The retry is scheduled on the (fake) clock.
+    await vi.advanceTimersByTimeAsync(1);
+    expect(Exit.isFailure(await pausing)).toBe(true);
+
+    expect(putAttempts).toBe(2);
+    expect(sessionA.pendingLeaseCount()).toBe(0);
+    expect(sessionA.activeKeepAlives).toBe(0);
+  });
+
+  it("answers a slow owner session forward as in progress and keeps the record", async () => {
     const { directory, namespace } = makeDirectory();
     const requesterEngine = makeEngine(() => null);
     const forward = vi.fn(() => Effect.never);
@@ -736,18 +781,19 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     const pending = sessionB.resumeViaModelTool("exec_timeout", approval);
     await vi.advanceTimersByTimeAsync(10_000);
 
-    await expect(pending).resolves.toEqual({
-      status: "execution_expired",
-      ttlMs: PAUSED_APPROVAL_TIMEOUT_MS,
-    });
+    // The owner may still be running the resumed call; it is not expired.
+    await expect(pending).resolves.toEqual({ status: "execution_in_progress" });
     expect(forward).toHaveBeenCalledTimes(1);
-    expect(await Effect.runPromise(directory.get("exec_timeout"))).toBeNull();
+    expect(await Effect.runPromise(directory.get("exec_timeout"))).toMatchObject({
+      executionId: "exec_timeout",
+      owner: { sessionId: "session-a" },
+    });
   });
 
   describe("after the client DELETEs the owning session", () => {
-    const setup = async () => {
+    const setup = async (resumeMs = 0) => {
       const { directory, namespace } = makeDirectory();
-      const owner = makePausingEngine("exec_owner");
+      const owner = makePausingEngine("exec_owner", resumeMs);
       const sessions = new Map<string, HarnessSession>();
       const sessionNamespace = {
         idFromName: (name: string) => name,
@@ -795,18 +841,60 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
       expect(owner.sideEffects()).toBe(1);
     });
 
+    it("runs the call once when two sessions resume at the same time", async () => {
+      const { owner, sessionB, newSession } = await setup(1000);
+      const sessionC = newSession("session-c");
+      await sessionC.storeSessionMeta();
+
+      const first = sessionB.resumeViaModelTool("exec_owner", approval);
+      const second = sessionC.resumeViaModelTool("exec_owner", approval);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      for (const outcome of await Promise.all([first, second])) {
+        expect(outcome).toMatchObject({
+          status: "result",
+          result: { structuredContent: { status: "completed", result: "owner-result" } },
+        });
+      }
+      expect(owner.sideEffects()).toBe(1);
+
+      const sessionD = newSession("session-d");
+      await sessionD.storeSessionMeta();
+      expect(await sessionD.resumeViaModelTool("exec_owner", approval)).toEqual({
+        status: "execution_already_settled",
+      });
+      expect(owner.sideEffects()).toBe(1);
+    });
+
     it("answers a second resume as already settled without running the call again", async () => {
       const { owner, sessionA, sessionB, newSession } = await setup();
       await sessionB.resumeViaModelTool("exec_owner", approval);
       // The resume released the lease, so the deferred destroy now runs.
       await sessionA.fireDueAlarm();
 
+      // Later than the original 4-minute pause deadline.
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
       const sessionC = newSession("session-c");
       await sessionC.storeSessionMeta();
       const retry = await sessionC.resumeViaModelTool("exec_owner", approval);
 
       expect(retry).toEqual({ status: "execution_already_settled" });
       expect(owner.sideEffects()).toBe(1);
+    });
+
+    it("expires an overdue lease from the alarm when its timer never fired", async () => {
+      const { directory, sessionA } = await setup();
+      // The in-isolate expiry timer is lost; only the durable alarm is left.
+      vi.clearAllTimers();
+
+      await vi.advanceTimersByTimeAsync(PAUSED_APPROVAL_TIMEOUT_MS + 1);
+      await sessionA.fireDueAlarm();
+
+      expect(sessionA.pendingLeaseCount()).toBe(0);
+      expect(await sessionA.storedSessionMeta()).toBeUndefined();
+      expect(await Effect.runPromise(directory.get("exec_owner"))).toMatchObject({
+        outcome: "expired",
+      });
     });
 
     it("destroys the session once an unanswered lease expires", async () => {
@@ -821,8 +909,13 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
       expect(sessionA.pendingLeaseCount()).toBe(0);
       expect(sessionA.activeKeepAlives).toBe(0);
       expect(await sessionA.storedSessionMeta()).toBeUndefined();
-      expect(await Effect.runPromise(directory.get("exec_owner"))).toBeNull();
-      expect(await sessionB.resumeViaModelTool("exec_owner", approval)).toBeNull();
+      expect(await Effect.runPromise(directory.get("exec_owner"))).toMatchObject({
+        outcome: "expired",
+      });
+      expect(await sessionB.resumeViaModelTool("exec_owner", approval)).toEqual({
+        status: "execution_expired",
+        ttlMs: PAUSED_APPROVAL_TIMEOUT_MS,
+      });
     });
   });
 

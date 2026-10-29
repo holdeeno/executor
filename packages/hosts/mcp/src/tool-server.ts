@@ -351,10 +351,12 @@ export const PAUSED_APPROVAL_TIMEOUT_MS = 4 * 60 * 1000;
 const BROWSER_APPROVAL_WAIT_TIMEOUT_MS = PAUSED_APPROVAL_TIMEOUT_MS + 1000;
 
 export type PausedExecutionHooks = {
+  /** Records the pause with the host. A failure means no other session can
+   * find it, so the pause is canceled instead of reported. */
   readonly onExecutionPaused?: (
     executionId: string,
     deadline: PausedExecutionDeadline | undefined,
-  ) => Effect.Effect<void>;
+  ) => Effect.Effect<void, unknown>;
   readonly onResumeStarted?: (executionId: string) => Effect.Effect<void>;
   readonly onResumeSettled?: (executionId: string) => Effect.Effect<void>;
 };
@@ -363,7 +365,8 @@ export type ResumeUnavailableStatus =
   | "execution_not_found"
   | "execution_expired"
   | "execution_forbidden"
-  | "execution_already_settled";
+  | "execution_already_settled"
+  | "execution_in_progress";
 
 export type ResumeFallbackOutcome =
   | {
@@ -880,6 +883,11 @@ const resumeUnavailableResult = (input: {
       "The resume result is no longer available for replay.",
       "Run execute again only if the result is still needed.",
     ],
+    execution_in_progress: [
+      `Paused execution is still resuming in its owning session: ${input.executionId}.`,
+      "Wait a moment, then call resume again with the same executionId.",
+      "Do not run execute again; the approved call may already be running.",
+    ],
   };
   return {
     content: [
@@ -892,11 +900,35 @@ const resumeUnavailableResult = (input: {
       status: input.status,
       executionId: input.executionId,
       ...(input.status === "execution_expired" ? { ttlMs: windowMs } : {}),
-      ...(input.status === "execution_forbidden" ? {} : { recovery: "re_execute" }),
+      ...(input.status === "execution_forbidden"
+        ? {}
+        : { recovery: input.status === "execution_in_progress" ? "retry_resume" : "re_execute" }),
     },
     isError: true,
   };
 };
+
+/** Declines a pause the host could not record, the way an expired approval is
+ * declined, so the paused call never runs. */
+export const PAUSE_NOT_RECORDED_RESPONSE = {
+  action: "decline",
+  content: { reason: "pause_not_recorded" },
+} satisfies ResumeResponse;
+
+export const pauseNotRecordedResult = (executionId: string): McpToolResult => ({
+  content: [
+    {
+      type: "text" as const,
+      text: [
+        `The call paused for approval, but the pause could not be saved: ${executionId}.`,
+        "It was canceled and the paused call did not run.",
+        recoveryText,
+      ].join(" "),
+    },
+  ],
+  structuredContent: { status: "pause_not_recorded", executionId, recovery: "re_execute" },
+  isError: true,
+});
 
 const missingExecutionResult = (executionId: string): McpToolResult =>
   resumeUnavailableResult({ status: "execution_not_found", executionId });
@@ -1579,11 +1611,20 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         ? undefined
         : { ttlMs, expiresAt: new Date(Date.now() + ttlMs).toISOString() };
     };
-    const onExecutionPaused = (
+    /** Null once the pause is recorded; otherwise the pause is canceled and
+     * this is the error to answer with. Never report a pause that failed this. */
+    const recordPause = (
       executionId: string,
       deadline: PausedExecutionDeadline | undefined,
-    ): Effect.Effect<void> =>
-      config.pausedExecutionHooks?.onExecutionPaused?.(executionId, deadline) ?? Effect.void;
+    ): Effect.Effect<McpToolResult | null> =>
+      (config.pausedExecutionHooks?.onExecutionPaused?.(executionId, deadline) ?? Effect.void).pipe(
+        Effect.as(null),
+        Effect.catchCause(() =>
+          engine
+            .resume(executionId, PAUSE_NOT_RECORDED_RESPONSE)
+            .pipe(Effect.ignore, Effect.as(pauseNotRecordedResult(executionId))),
+        ),
+      );
     const onResumeStarted = (executionId: string): Effect.Effect<void> =>
       config.pausedExecutionHooks?.onResumeStarted?.(executionId) ?? Effect.void;
     const onResumeSettled = (executionId: string): Effect.Effect<void> =>
@@ -1616,7 +1657,8 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           "mcp.execute.paused_execution_id": execution.id,
           "mcp.execute.pause_source": source,
         });
-        yield* onExecutionPaused(execution.id, deadline);
+        const unrecorded = yield* recordPause(execution.id, deadline);
+        if (unrecorded) return unrecorded;
         return toMcpPausedResult(formatPausedExecution(execution, { deadline }));
       });
 
@@ -1706,7 +1748,8 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
             "mcp.execute.paused_execution_id": outcome.execution.id,
             "mcp.execute.pause_source": "execute",
           });
-          yield* onExecutionPaused(outcome.execution.id, deadline);
+          const unrecorded = yield* recordPause(outcome.execution.id, deadline);
+          if (unrecorded) return unrecorded;
           return elicitationMode.mode === "browser"
             ? yield* requireUserResumeApproval(outcome.execution.id)
             : toMcpPausedResult(formatPausedExecution(outcome.execution, { deadline }));
@@ -1961,7 +2004,8 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
             "mcp.execute.paused_execution_id": outcome.execution.id,
             "mcp.execute.pause_source": "browser_resume",
           });
-          yield* onExecutionPaused(outcome.execution.id, deadline);
+          const unrecorded = yield* recordPause(outcome.execution.id, deadline);
+          if (unrecorded) return unrecorded;
         }
         return outcome.status === "completed"
           ? toMcpResult(outcome.result)

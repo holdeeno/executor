@@ -5,6 +5,8 @@ export type McpExecutionOwnerRoute = {
   readonly sessionId: string;
 };
 
+export type McpExecutionOwnerOutcome = "settled" | "expired";
+
 export type McpExecutionOwnerRecord = {
   readonly executionId: string;
   readonly owner: McpExecutionOwnerRoute;
@@ -12,9 +14,10 @@ export type McpExecutionOwnerRecord = {
   readonly organizationId: string;
   readonly expiresAt: string;
   readonly ttlMs: number;
-  /** The execution was resumed to an outcome. Kept until `expiresAt` so a
-   * retried resume from any session is answered, not run again. */
-  readonly settled?: true;
+  /** Set once the pause ended: resumed to a result, or its approval window
+   * ran out. The record then lives on its own `expiresAt` so a late resume
+   * from any session is answered, never run again. */
+  readonly outcome?: McpExecutionOwnerOutcome;
 };
 
 export interface McpExecutionOwnerDirectory {
