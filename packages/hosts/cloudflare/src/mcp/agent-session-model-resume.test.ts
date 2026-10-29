@@ -60,16 +60,33 @@ vi.mock("agents/mcp", () => ({
       return Promise.resolve([]);
     }
 
+    getOpenStreamRequestIds(): Promise<readonly unknown[]> {
+      return Promise.resolve([]);
+    }
+
+    currentSessionEpoch(): Promise<number> {
+      return Promise.resolve(0);
+    }
+
     onConnect(): Promise<void> {
       return Promise.resolve();
     }
 
-    alarm(): Promise<void> {
-      return Promise.resolve();
+    // Mirrors the SDK's session DELETE: a durable "condemned" marker plus an
+    // alarm, which then runs `destroy()` and wipes storage.
+    async _cf_scheduleDestroy(): Promise<void> {
+      await this.ctx.storage.put("cf_agents_destroy_pending", true);
+      await this.ctx.storage.setAlarm(Date.now() + 1000);
     }
 
-    destroy(): Promise<void> {
-      return Promise.resolve();
+    async alarm(): Promise<void> {
+      if ((await this.ctx.storage.get("cf_agents_destroy_pending")) === true) {
+        await this.destroy();
+      }
+    }
+
+    async destroy(): Promise<void> {
+      await this.ctx.storage.deleteAll();
     }
   },
 }));
@@ -277,6 +294,29 @@ const makeEngine = (
   return { calls, engine, orgWriteAccesses, resume };
 };
 
+/** An engine holding one live pause, like the real one: resuming runs the
+ * paused tool call once, and the id is then remembered as settled. */
+const makePausingEngine = (executionId: string) => {
+  const paused = new Set([executionId]);
+  const settled = new Set<string>();
+  let sideEffects = 0;
+  const { engine } = makeEngine(() => null);
+  const pausingEngine: ExecutionEngine<Cause.YieldableError> = {
+    ...engine,
+    resume: (id) =>
+      Effect.sync(() => {
+        if (!paused.delete(id)) return null;
+        sideEffects += 1;
+        settled.add(id);
+        return completed("owner-result");
+      }),
+    pausedExecutionCount: () => Effect.sync(() => paused.size),
+    hasPausedExecutions: () => Effect.sync(() => paused.size > 0),
+    isExecutionSettled: (id) => Effect.sync(() => settled.has(id)),
+  };
+  return { engine: pausingEngine, sideEffects: () => sideEffects };
+};
+
 const sessionMeta = (input?: Partial<SessionMeta>): SessionMeta => ({
   organizationId: "org_1",
   organizationName: "Test Org",
@@ -373,6 +413,15 @@ class HarnessSession extends McpAgentSessionDOBase<Cloudflare.Env, TestDbHandle>
     this.activeKeepAlives += 1;
     return Promise.resolve(() => {
       this.activeKeepAlives -= 1;
+      // The SDK re-arms the alarm when the last ref goes; with a destroy
+      // pending it arms it for now.
+      if (this.activeKeepAlives === 0) {
+        this.fakeState.waitUntil(
+          this.fakeState.storage.get("cf_agents_destroy_pending").then(async (pending) => {
+            if (pending === true) await this.fakeState.storage.setAlarm(Date.now());
+          }),
+        );
+      }
     });
   }
 
@@ -380,11 +429,30 @@ class HarnessSession extends McpAgentSessionDOBase<Cloudflare.Env, TestDbHandle>
     await this.fakeState.storage.put("session-meta", this.meta);
   }
 
+  /** Pause as the tool server does: it awaits the hook, then answers. Work the
+   * hook leaves on `waitUntil` is not flushed — a DELETE can cancel it. */
   async startPause(executionId: string): Promise<void> {
     await Effect.runPromise(
       this.pausedExecutionHooks.onExecutionPaused?.(executionId, deadline()) ?? Effect.void,
     );
+  }
+
+  /** Run the Durable Object alarm if it is due, as the platform would. */
+  async fireDueAlarm(): Promise<void> {
     await this.fakeState.flushWaitUntil();
+    const at = this.fakeState.storage.alarmAt;
+    if (at === null || at > Date.now()) return;
+    this.fakeState.storage.alarmAt = null;
+    await this.alarm();
+    await this.fakeState.flushWaitUntil();
+  }
+
+  async flushWaitUntil(): Promise<void> {
+    await this.fakeState.flushWaitUntil();
+  }
+
+  async storedSessionMeta(): Promise<unknown> {
+    return this.fakeState.storage.get("session-meta");
   }
 
   /** Resume as the MCP `resume` tool does, under the request's write access. */
@@ -674,6 +742,88 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     });
     expect(forward).toHaveBeenCalledTimes(1);
     expect(await Effect.runPromise(directory.get("exec_timeout"))).toBeNull();
+  });
+
+  describe("after the client DELETEs the owning session", () => {
+    const setup = async () => {
+      const { directory, namespace } = makeDirectory();
+      const owner = makePausingEngine("exec_owner");
+      const sessions = new Map<string, HarnessSession>();
+      const sessionNamespace = {
+        idFromName: (name: string) => name,
+        get: (id: string) => sessions.get(id),
+      };
+      const newSession = (sessionId: string, engine = makeEngine(() => null).engine) =>
+        new HarnessSession({
+          sessionId,
+          engine,
+          directoryNamespace: namespace,
+          forwardModelResumeToOwner: (route, identity, executionId, response) =>
+            Effect.promise(() =>
+              mcpSessionStub(sessionNamespace, route.sessionId).resumeExecutionForModel(
+                executionId,
+                identity,
+                response,
+              ),
+            ),
+        });
+      const sessionA = newSession("session-a", owner.engine);
+      sessions.set(mcpSessionDurableObjectName("session-a"), sessionA);
+      await sessionA.storeSessionMeta();
+      await sessionA.startPause("exec_owner");
+
+      // Cursor sends DELETE right after the paused call; the SDK runs the
+      // destroy from an alarm about a second later.
+      await sessionA._cf_scheduleDestroy();
+      await vi.advanceTimersByTimeAsync(1000);
+      await sessionA.fireDueAlarm();
+
+      const sessionB = newSession("session-b");
+      await sessionB.storeSessionMeta();
+      return { directory, owner, sessionA, sessionB, newSession };
+    };
+
+    it("still resumes the pause from a new session", async () => {
+      const { owner, sessionB } = await setup();
+
+      const outcome = await sessionB.resumeViaModelTool("exec_owner", approval);
+
+      expect(outcome).toMatchObject({
+        status: "result",
+        result: { structuredContent: { status: "completed", result: "owner-result" } },
+      });
+      expect(owner.sideEffects()).toBe(1);
+    });
+
+    it("answers a second resume as already settled without running the call again", async () => {
+      const { owner, sessionA, sessionB, newSession } = await setup();
+      await sessionB.resumeViaModelTool("exec_owner", approval);
+      // The resume released the lease, so the deferred destroy now runs.
+      await sessionA.fireDueAlarm();
+
+      const sessionC = newSession("session-c");
+      await sessionC.storeSessionMeta();
+      const retry = await sessionC.resumeViaModelTool("exec_owner", approval);
+
+      expect(retry).toEqual({ status: "execution_already_settled" });
+      expect(owner.sideEffects()).toBe(1);
+    });
+
+    it("destroys the session once an unanswered lease expires", async () => {
+      const { directory, sessionA, sessionB } = await setup();
+      // Held open past the DELETE while the approval is outstanding.
+      expect(await sessionA.storedSessionMeta()).toBeDefined();
+
+      await vi.advanceTimersByTimeAsync(PAUSED_APPROVAL_TIMEOUT_MS);
+      await sessionA.flushWaitUntil();
+      await sessionA.fireDueAlarm();
+
+      expect(sessionA.pendingLeaseCount()).toBe(0);
+      expect(sessionA.activeKeepAlives).toBe(0);
+      expect(await sessionA.storedSessionMeta()).toBeUndefined();
+      expect(await Effect.runPromise(directory.get("exec_owner"))).toBeNull();
+      expect(await sessionB.resumeViaModelTool("exec_owner", approval)).toBeNull();
+    });
   });
 
   it("does not recurse when the directory maps a local miss back to the same session", async () => {

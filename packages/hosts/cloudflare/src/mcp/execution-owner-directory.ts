@@ -12,6 +12,9 @@ export type McpExecutionOwnerRecord = {
   readonly organizationId: string;
   readonly expiresAt: string;
   readonly ttlMs: number;
+  /** The execution was resumed to an outcome. Kept until `expiresAt` so a
+   * retried resume from any session is answered, not run again. */
+  readonly settled?: true;
 };
 
 export interface McpExecutionOwnerDirectory {

@@ -120,6 +120,7 @@ type McpSessionApprovalErrorResult =
 
 type PendingApprovalLease = {
   readonly disposeKeepAlive: () => void;
+  readonly deadline: PausedExecutionDeadline | undefined;
   timeout: ReturnType<typeof setTimeout> | null;
   expiring: boolean;
 };
@@ -218,6 +219,8 @@ const PARTYSERVER_NAME_KEY = "__ps_name";
 const UNRESOLVED_SESSION_ID = "unresolved";
 /** The agents SDK's durable "condemned" marker (`_cf_scheduleDestroy`). */
 const AGENTS_DESTROY_PENDING_KEY = "cf_agents_destroy_pending";
+/** Matches the agents SDK's default keep-alive heartbeat interval. */
+const CLOSED_SESSION_LEASE_RECHECK_MS = 30_000;
 const MCP_HTTP_METHOD_HEADER = "cf-mcp-method";
 const MCP_MESSAGE_HEADER = "cf-mcp-message";
 const MODEL_RESUME_FORWARD_TIMEOUT_MS = 10_000;
@@ -632,10 +635,12 @@ export abstract class McpAgentSessionDOBase<
     this.resumeFromExecutionOwnerDirectory(executionId, response);
 
   protected readonly pausedExecutionHooks: PausedExecutionHooks = {
+    // Awaited, not queued on `waitUntil`: the tool server answers with the
+    // paused result only after this settles, so the owner directory entry a
+    // resume from another session needs is already written. Clients DELETE the
+    // session right after that answer, and a teardown cancels queued work.
     onExecutionPaused: (executionId, deadline) =>
-      Effect.sync(() => {
-        this.queuePendingApprovalLeaseStart(executionId, deadline);
-      }),
+      this.startPendingApprovalLease(executionId, deadline),
     onResumeStarted: (executionId) => this.beginPendingApprovalResume(executionId),
     onResumeSettled: (executionId) => this.finishPendingApprovalResume(executionId),
   };
@@ -1076,7 +1081,7 @@ export abstract class McpAgentSessionDOBase<
   /**
    * Fires the eviction REQUEST at `candidate`'s own stub and returns
    * immediately — same fire-and-forget shape as
-   * `queuePendingApprovalLeaseStart`/`queuePendingApprovalLeaseExpiration`
+   * `queuePendingApprovalLeaseExpiration`
    * below. `markEvictionRequested` is stamped up front, before the request
    * even lands, so a stuck or slow candidate cannot be re-picked by the next
    * init in the meantime (see `pickEvictionCandidate`'s grace period).
@@ -1626,10 +1631,7 @@ export abstract class McpAgentSessionDOBase<
         // terminated id is dead the moment the DELETE returns. (The old code
         // won this race by accident: its onConnect drain-wait stalled the
         // request until the destroy alarm aborted the isolate.)
-        const destroyPending = yield* Effect.promise(() =>
-          self.ctx.storage.get<boolean>(AGENTS_DESTROY_PENDING_KEY),
-        );
-        if (destroyPending === true) return "terminated" as const;
+        if (yield* Effect.promise(() => self.destroyPending())) return "terminated" as const;
         const sessionMeta = yield* self.loadSessionMeta();
         if (!sessionMeta) return "not_found" as const;
         if (self.initialized) {
@@ -1801,6 +1803,10 @@ export abstract class McpAgentSessionDOBase<
     await super.destroy();
   }
 
+  private async destroyPending(): Promise<boolean> {
+    return (await this.ctx.storage.get<boolean>(AGENTS_DESTROY_PENDING_KEY)) === true;
+  }
+
   private async pausedExecutionCount(): Promise<number> {
     if (!this.engine) return 0;
     return Effect.runPromise(this.engine.pausedExecutionCount());
@@ -1813,6 +1819,20 @@ export abstract class McpAgentSessionDOBase<
     // no longer die on the next read of an id it just decided exists.
     if ((await this.resolveSessionName()) === undefined) {
       await this.cleanupUnaddressableSessionAlarm();
+      return;
+    }
+    // A DELETE closed this session (requests already read it as terminated),
+    // but a paused execution here is still waiting on its approval, and the
+    // paused run lives only in this isolate. Hold off the SDK's destroy until
+    // the lease is resumed or expires: releasing its keep-alive re-arms this
+    // alarm for now, and the destroy then runs. The short re-check stands in
+    // for the SDK heartbeat this path skips, so the isolate stays resident.
+    if (await this.destroyPending()) {
+      if (this.pendingApprovalLeases.size > 0) {
+        await this.ctx.storage.setAlarm(Date.now() + CLOSED_SESSION_LEASE_RECHECK_MS);
+        return;
+      }
+      await super.alarm();
       return;
     }
     const lastActivityMs = await this.loadLastActivity();
@@ -1918,6 +1938,7 @@ export abstract class McpAgentSessionDOBase<
   private writeExecutionOwnerEntry(
     executionId: string,
     deadline: PausedExecutionDeadline | undefined,
+    settled = false,
   ): Effect.Effect<void> {
     const directory = this.executionOwnerDirectory();
     if (!directory || !deadline) return Effect.void;
@@ -1932,6 +1953,7 @@ export abstract class McpAgentSessionDOBase<
         organizationId: sessionMeta.organizationId,
         expiresAt: deadline.expiresAt,
         ttlMs: deadline.ttlMs,
+        ...(settled ? { settled: true as const } : {}),
       };
       yield* directory
         .put(record)
@@ -1997,6 +2019,10 @@ export abstract class McpAgentSessionDOBase<
         return { status: "execution_forbidden" } as const;
       }
 
+      // The owner already resumed this execution (and may since have been
+      // destroyed). Answer the retry; never run the paused call twice.
+      if (record.settled) return { status: "execution_already_settled" } as const;
+
       if (self.sameExecutionOwnerRoute(record.owner, self.executionOwnerRoute())) {
         yield* self.deleteExecutionOwnerEntry(executionId);
         return { status: "execution_expired", ttlMs: record.ttlMs } as const;
@@ -2028,11 +2054,7 @@ export abstract class McpAgentSessionDOBase<
             }),
           ),
         );
-      if (
-        forwarded.status === "execution_expired" ||
-        forwarded.status === "execution_not_found" ||
-        forwarded.status === "execution_already_settled"
-      ) {
+      if (forwarded.status === "execution_expired" || forwarded.status === "execution_not_found") {
         yield* self.deleteExecutionOwnerEntry(executionId);
       }
       return forwarded.status === "execution_not_found"
@@ -2065,7 +2087,12 @@ export abstract class McpAgentSessionDOBase<
       const timeout = setTimeout(() => {
         self.queuePendingApprovalLeaseExpiration(executionId);
       }, PAUSED_APPROVAL_TIMEOUT_MS);
-      self.pendingApprovalLeases.set(executionId, { disposeKeepAlive, timeout, expiring: false });
+      self.pendingApprovalLeases.set(executionId, {
+        disposeKeepAlive,
+        deadline,
+        timeout,
+        expiring: false,
+      });
       yield* self.writeExecutionOwnerEntry(executionId, deadline);
     }).pipe(
       Effect.withSpan("McpSessionDO.pending_approval_lease.start", {
@@ -2081,13 +2108,6 @@ export abstract class McpAgentSessionDOBase<
       ),
       Effect.ignore,
     );
-  }
-
-  private queuePendingApprovalLeaseStart(
-    executionId: string,
-    deadline: PausedExecutionDeadline | undefined,
-  ): void {
-    this.ctx.waitUntil(Effect.runPromise(this.startPendingApprovalLease(executionId, deadline)));
   }
 
   private queuePendingApprovalLeaseExpiration(executionId: string): void {
@@ -2123,22 +2143,36 @@ export abstract class McpAgentSessionDOBase<
   }
 
   private finishPendingApprovalResume(executionId: string): Effect.Effect<void> {
-    return this.releasePendingApprovalLease(executionId).pipe(
+    const self = this;
+    return Effect.gen(function* () {
+      const settled =
+        self.pendingApprovalLeases.has(executionId) && self.engine?.isExecutionSettled
+          ? yield* self.engine.isExecutionSettled(executionId)
+          : false;
+      yield* self.releasePendingApprovalLease(executionId, settled);
+    }).pipe(
       Effect.withSpan("McpSessionDO.pending_approval_lease.finish", {
         attributes: { "mcp.execution.id": executionId },
       }),
     );
   }
 
-  private releasePendingApprovalLease(executionId: string): Effect.Effect<void> {
+  /**
+   * `settled` keeps the owner directory record, marked settled, instead of
+   * deleting it. The directory is written before the keep-alive goes: dropping
+   * the last one lets a DELETE-deferred destroy run.
+   */
+  private releasePendingApprovalLease(executionId: string, settled = false): Effect.Effect<void> {
     const self = this;
     return Effect.gen(function* () {
       const lease = self.pendingApprovalLeases.get(executionId);
       if (!lease) return;
       if (lease.timeout) clearTimeout(lease.timeout);
       self.pendingApprovalLeases.delete(executionId);
+      yield* settled
+        ? self.writeExecutionOwnerEntry(executionId, lease.deadline, true)
+        : self.deleteExecutionOwnerEntry(executionId);
       lease.disposeKeepAlive();
-      yield* self.deleteExecutionOwnerEntry(executionId);
     });
   }
 
