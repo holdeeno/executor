@@ -2095,14 +2095,15 @@ export abstract class McpAgentSessionDOBase<
                   owner: record.owner,
                   timeoutMs: MODEL_RESUME_FORWARD_TIMEOUT_MS,
                 })
-                .pipe(Effect.andThen(self.markOwnerRecordOutcomeUnknown(record))),
+                .pipe(Effect.as(null)),
           }),
           Effect.catchCause((cause) =>
             self
               .logModelResumeForwardFailure({ executionId, owner: record.owner, cause })
-              .pipe(Effect.andThen(self.markOwnerRecordOutcomeUnknown(record))),
+              .pipe(Effect.as(null)),
           ),
         );
+      if (!forwarded) return yield* self.answerAfterLostForward(record);
       if (forwarded.status === "execution_expired" || forwarded.status === "execution_not_found") {
         yield* self.deleteExecutionOwnerEntry(executionId);
       }
@@ -2115,29 +2116,36 @@ export abstract class McpAgentSessionDOBase<
   /**
    * A forward to the owner timed out or failed. The owner may still be running
    * the call, or may have run it before the failure surfaced, so this is not
-   * an expiry: keep the record, marked unknown, and say so to every retry.
+   * an expiry. Mark the record unknown, which the directory refuses once the
+   * owner has marked it resuming, settled or expired, and answer from
+   * whatever the record says afterwards.
    */
-  private markOwnerRecordOutcomeUnknown(
+  private answerAfterLostForward(
     record: McpExecutionOwnerRecord,
-  ): Effect.Effect<{ readonly status: "execution_outcome_unknown" }> {
+  ): Effect.Effect<ResumeFallbackOutcome> {
     const self = this;
     return Effect.gen(function* () {
       const directory = self.executionOwnerDirectory();
-      if (directory) {
-        yield* directory
-          .put({ ...record, outcome: "unknown", expiresAt: outcomeRecordExpiresAt() })
-          .pipe(
-            Effect.tapCause((cause) =>
-              self.logExecutionOwnerDirectoryFailure({
-                operation: "put",
-                executionId: record.executionId,
-                cause,
-              }),
-            ),
-            Effect.ignore,
-          );
+      const held = directory
+        ? yield* directory
+            .put({ ...record, outcome: "unknown", expiresAt: outcomeRecordExpiresAt() })
+            .pipe(
+              Effect.tapCause((cause) =>
+                self.logExecutionOwnerDirectoryFailure({
+                  operation: "put",
+                  executionId: record.executionId,
+                  cause,
+                }),
+              ),
+              Effect.catchCause(() => Effect.succeed(null)),
+            )
+        : null;
+      if (held?.outcome === "resuming") return { status: "execution_in_progress" } as const;
+      if (held?.outcome === "settled") return { status: "execution_already_settled" } as const;
+      if (held?.outcome === "expired") {
+        return { status: "execution_expired", ttlMs: held.ttlMs } as const;
       }
-      return { status: "execution_outcome_unknown" as const };
+      return { status: "execution_outcome_unknown" } as const;
     });
   }
 

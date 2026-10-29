@@ -937,7 +937,9 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
       await vi.advanceTimersByTimeAsync(30_000);
       await sessionA.fireDueAlarm();
 
-      expect(await first).toEqual({ status: "execution_outcome_unknown" });
+      // The owner marked the record resuming, so the timed-out forward does
+      // not claim the outcome is unknown.
+      expect(await first).toEqual({ status: "execution_in_progress" });
       expect(await Effect.runPromise(directory.get("exec_owner"))).toMatchObject({
         outcome: "settled",
       });
@@ -963,6 +965,26 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
 
       await vi.advanceTimersByTimeAsync(1);
       expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toBeNull();
+    });
+
+    it("answers in progress when a forward times out on a resume the owner is running", async () => {
+      const { owner, sessionB, newSession } = await setup(5 * 60 * 1000);
+
+      const first = sessionB.resumeViaModelTool("exec_owner", approval);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await first).toEqual({ status: "execution_in_progress" });
+
+      const sessionC = newSession("session-c");
+      await sessionC.storeSessionMeta();
+      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toEqual({
+        status: "execution_in_progress",
+      });
+
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toEqual({
+        status: "execution_already_settled",
+      });
+      expect(owner.sideEffects()).toBe(1);
     });
 
     it("answers a retry as in progress while a resume runs past the pause deadline", async () => {
