@@ -90,6 +90,9 @@ vi.mock("agents/mcp", () => ({
 
     async destroy(): Promise<void> {
       await this.ctx.storage.deleteAll();
+      setTimeout(() => {
+        this.ctx.abort("destroyed");
+      }, 0);
     }
   },
 }));
@@ -172,11 +175,16 @@ class FakeStorage implements DurableObjectStorage {
 
   async setAlarm(scheduledTime: number | Date): Promise<void> {
     this.alarmAt = scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime;
+    this.onAlarmChange?.();
   }
 
   async deleteAlarm(): Promise<void> {
     this.alarmAt = null;
+    this.onAlarmChange?.();
   }
+
+  /** Set by a harness that lets alarms fire on their own, as the platform does. */
+  onAlarmChange: (() => void) | undefined;
 }
 
 class FakeDurableObjectState implements DurableObjectState {
@@ -194,6 +202,7 @@ class FakeDurableObjectState implements DurableObjectState {
       toString: () => name,
     };
     this.id = id as DurableObjectId;
+    void this.aborted.then(undefined, () => undefined);
   }
 
   waitUntil(promise: Promise<unknown>): void {
@@ -237,7 +246,18 @@ class FakeDurableObjectState implements DurableObjectState {
     return null;
   }
 
-  abort(_reason?: string): void {}
+  private rejectAborted: (reason: unknown) => void = () => undefined;
+  /** Rejects once the object is aborted, as every call still in flight to a
+   * Durable Object does when the platform aborts it. */
+  readonly aborted = new Promise<never>((_, reject) => {
+    this.rejectAborted = reject;
+  });
+  isAborted = false;
+
+  abort(reason?: string): void {
+    this.isAborted = true;
+    this.rejectAborted(reason ?? "aborted");
+  }
 }
 
 class InMemoryExecutionOwnerDirectoryNamespace implements McpExecutionOwnerDirectoryNamespace<string> {
@@ -301,6 +321,7 @@ const makeEngine = (
  * paused tool call once, a resume that lands while it runs joins it, and the
  * id is then remembered as settled. `resumeMs` is how long the call runs. */
 const makePausingEngine = (executionId: string, resumeMs = 0) => {
+  // Only an approval runs the paused call; a decline completes without it.
   const paused = new Set([executionId]);
   const settled = new Set<string>();
   const running = new Map<string, Promise<ExecutionResult>>();
@@ -308,17 +329,18 @@ const makePausingEngine = (executionId: string, resumeMs = 0) => {
   const { engine } = makeEngine(() => null);
   const pausingEngine: ExecutionEngine<Cause.YieldableError> = {
     ...engine,
-    resume: (id) =>
+    resume: (id, response) =>
       Effect.promise(async () => {
         const joined = running.get(id);
         if (joined) return joined;
         if (!paused.delete(id)) return null;
-        sideEffects += 1;
+        const accepted = response.action === "accept";
+        if (accepted) sideEffects += 1;
         const run = new Promise<ExecutionResult>((resolve) => {
           const finish = () => {
             settled.add(id);
             running.delete(id);
-            resolve(completed("owner-result"));
+            resolve(completed(accepted ? "owner-result" : "declined"));
           };
           if (resumeMs === 0) finish();
           else setTimeout(finish, resumeMs);
@@ -381,6 +403,7 @@ class HarnessSession extends McpAgentSessionDOBase<Cloudflare.Env, TestDbHandle>
     response: ResumeResponse,
   ) => Effect.Effect<McpSessionModelResumeResult, unknown>;
   activeKeepAlives = 0;
+  private readonly flushMs: number;
 
   constructor(input: {
     readonly sessionId: string;
@@ -388,10 +411,23 @@ class HarnessSession extends McpAgentSessionDOBase<Cloudflare.Env, TestDbHandle>
     readonly engine: ExecutionEngine<Cause.YieldableError>;
     readonly directoryNamespace: McpExecutionOwnerDirectoryNamespace<string>;
     readonly forwardModelResumeToOwner?: HarnessSession["modelResumeForward"];
+    /** Fire alarms on their own when due and let span export take this long,
+     * so the platform's alarm can interleave with an RPC still returning. */
+    readonly live?: { readonly flushMs: number };
   }) {
     const state = new FakeDurableObjectState(input.sessionId);
     super(state, {} as Cloudflare.Env);
     this.fakeState = state;
+    this.flushMs = input.live?.flushMs ?? 0;
+    if (input.live) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      state.storage.onAlarmChange = () => {
+        clearTimeout(timer);
+        const at = state.storage.alarmAt;
+        if (at === null || state.isAborted) return;
+        timer = setTimeout(() => void this.fireDueAlarm(), Math.max(0, at - Date.now()));
+      };
+    }
     this.meta = input.meta ?? sessionMeta();
     this.directory = mcpExecutionOwnerDirectoryFromNamespace(input.directoryNamespace);
     this.modelResumeForward =
@@ -419,6 +455,16 @@ class HarnessSession extends McpAgentSessionDOBase<Cloudflare.Env, TestDbHandle>
     response: ResumeResponse,
   ): Effect.Effect<McpSessionModelResumeResult, unknown> {
     return this.modelResumeForward(owner, identity, executionId, response);
+  }
+
+  protected override flushTelemetry(): Promise<void> {
+    if (this.flushMs === 0) return Promise.resolve();
+    return new Promise((resolve) => setTimeout(resolve, this.flushMs));
+  }
+
+  /** Rejects once the platform aborts this object. */
+  aborted(): Promise<never> {
+    return this.fakeState.aborted;
   }
 
   protected override openSessionDb(): TestDbHandle {
@@ -833,7 +879,7 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
   });
 
   describe("after the client DELETEs the owning session", () => {
-    const setup = async (resumeMs = 0) => {
+    const setup = async (resumeMs = 0, live?: { readonly flushMs: number }) => {
       const { directory, namespace } = makeDirectory();
       const owner = makePausingEngine("exec_owner", resumeMs);
       const sessions = new Map<string, HarnessSession>();
@@ -841,21 +887,30 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
         idFromName: (name: string) => name,
         get: (id: string) => sessions.get(id),
       };
-      const newSession = (sessionId: string, engine = makeEngine(() => null).engine) =>
+      const newSession = (
+        sessionId: string,
+        engine = makeEngine(() => null).engine,
+        liveOptions?: { readonly flushMs: number },
+      ) =>
         new HarnessSession({
           sessionId,
           engine,
           directoryNamespace: namespace,
+          ...(liveOptions ? { live: liveOptions } : {}),
+          // An abort of the owner rejects this call, as it does on the platform.
           forwardModelResumeToOwner: (route, identity, executionId, response) =>
             Effect.promise(() =>
-              mcpSessionStub(sessionNamespace, route.sessionId).resumeExecutionForModel(
-                executionId,
-                identity,
-                response,
-              ),
+              Promise.race([
+                mcpSessionStub(sessionNamespace, route.sessionId).resumeExecutionForModel(
+                  executionId,
+                  identity,
+                  response,
+                ),
+                sessions.get(mcpSessionDurableObjectName(route.sessionId))!.aborted(),
+              ]),
             ),
         });
-      const sessionA = newSession("session-a", owner.engine);
+      const sessionA = newSession("session-a", owner.engine, live);
       sessions.set(mcpSessionDurableObjectName("session-a"), sessionA);
       await sessionA.storeSessionMeta();
       await sessionA.startPause("exec_owner");
@@ -870,6 +925,36 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
       await sessionB.storeSessionMeta();
       return { directory, owner, sessionA, sessionB, newSession };
     };
+
+    const decline = { action: "decline" } satisfies ResumeResponse;
+    for (const [label, response, result, runs] of [
+      ["returns the declined result and runs nothing", decline, "declined", 0],
+      ["returns the call's result and runs it once", approval, "owner-result", 1],
+    ] as const) {
+      it(`hands a forwarded resume its result before the owner destroys itself: ${label}`, async () => {
+        // Alarms fire on their own and span export takes 50ms, so the owner's
+        // DELETE-deferred destroy can land while its RPC is still returning.
+        const { owner, sessionA, sessionB, newSession } = await setup(0, { flushMs: 50 });
+
+        const outcome = sessionB.resumeViaModelTool("exec_owner", response);
+        await vi.advanceTimersByTimeAsync(1000);
+
+        expect(await outcome).toMatchObject({
+          status: "result",
+          result: { structuredContent: { status: "completed", result } },
+        });
+        expect(owner.sideEffects()).toBe(runs);
+        // The owner still tears itself down once the result is handed back.
+        expect(await sessionA.storedSessionMeta()).toBeUndefined();
+
+        const sessionC = newSession("session-c");
+        await sessionC.storeSessionMeta();
+        expect(await sessionC.resumeViaModelTool("exec_owner", response)).toEqual({
+          status: "execution_already_settled",
+        });
+        expect(owner.sideEffects()).toBe(runs);
+      });
+    }
 
     it("still resumes the pause from a new session", async () => {
       const { owner, sessionB } = await setup();

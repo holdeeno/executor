@@ -388,6 +388,8 @@ export abstract class McpAgentSessionDOBase<
   private approvalResponses = new Map<string, BrowserApprovalDecision>();
   private approvalWaiters = new Map<string, Deferred.Deferred<BrowserApprovalDecision>>();
   private pendingApprovalLeases = new Map<string, PendingApprovalLease>();
+  /** Approval RPCs still running here, until their result is handed back. */
+  private requestsInFlight = 0;
 
   protected abstract openSessionDb(): TDbHandle | Promise<TDbHandle>;
 
@@ -1676,33 +1678,35 @@ export abstract class McpAgentSessionDOBase<
     incoming?: IncomingTraceHeaders,
   ): Promise<McpSessionApprovalResult> {
     const self = this;
-    return Effect.runPromise(
-      Effect.gen(function* () {
-        yield* self.prepareErrorCaptureScope();
-        const owner = yield* self.validateApprovalIdentity(identity);
-        if (owner !== "ok") return { status: owner } as const;
+    return this.servingRequest(() =>
+      Effect.runPromise(
+        Effect.gen(function* () {
+          yield* self.prepareErrorCaptureScope();
+          const owner = yield* self.validateApprovalIdentity(identity);
+          if (owner !== "ok") return { status: owner } as const;
 
-        const restored = yield* self.ensureRuntimeForApproval();
-        if (!restored || !self.engine) return { status: "not_found" } as const;
+          const restored = yield* self.ensureRuntimeForApproval();
+          if (!restored || !self.engine) return { status: "not_found" } as const;
 
-        const paused = yield* self.engine.getPausedExecution(executionId);
-        if (!paused) return { status: "not_found" } as const;
+          const paused = yield* self.engine.getPausedExecution(executionId);
+          if (!paused) return { status: "not_found" } as const;
 
-        const deadline = yield* self.deadlineForExecution(executionId);
-        const formatted = formatPausedExecution(paused, { deadline });
-        return {
-          status: "ok" as const,
-          text: formatted.text,
-          structured: formatted.structured,
-        };
-      }).pipe(
-        Effect.withSpan("McpSessionDO.getPausedExecutionForApproval", {
-          attributes: { "mcp.execution.id": executionId },
-        }),
-        (eff) => this.withTelemetry(eff, incoming),
-        // oxlint-disable-next-line executor/no-effect-escape-hatch -- boundary: DO RPC exposes Promise results
-        Effect.orDie,
-        (eff) => self.withSpanFlush(eff),
+          const deadline = yield* self.deadlineForExecution(executionId);
+          const formatted = formatPausedExecution(paused, { deadline });
+          return {
+            status: "ok" as const,
+            text: formatted.text,
+            structured: formatted.structured,
+          };
+        }).pipe(
+          Effect.withSpan("McpSessionDO.getPausedExecutionForApproval", {
+            attributes: { "mcp.execution.id": executionId },
+          }),
+          (eff) => this.withTelemetry(eff, incoming),
+          // oxlint-disable-next-line executor/no-effect-escape-hatch -- boundary: DO RPC exposes Promise results
+          Effect.orDie,
+          (eff) => self.withSpanFlush(eff),
+        ),
       ),
     );
   }
@@ -1714,76 +1718,78 @@ export abstract class McpAgentSessionDOBase<
     incoming?: IncomingTraceHeaders,
   ): Promise<McpSessionModelResumeResult> {
     const self = this;
-    return Effect.runPromise(
-      Effect.gen(function* () {
-        yield* self.prepareErrorCaptureScope();
-        const owner = yield* self.validateApprovalIdentity(identity);
-        if (owner === "forbidden") return { status: "execution_forbidden" } as const;
-        if (owner === "not_found") {
-          return { status: "execution_expired" as const, ttlMs: PAUSED_APPROVAL_TIMEOUT_MS };
-        }
+    return this.servingRequest(() =>
+      Effect.runPromise(
+        Effect.gen(function* () {
+          yield* self.prepareErrorCaptureScope();
+          const owner = yield* self.validateApprovalIdentity(identity);
+          if (owner === "forbidden") return { status: "execution_forbidden" } as const;
+          if (owner === "not_found") {
+            return { status: "execution_expired" as const, ttlMs: PAUSED_APPROVAL_TIMEOUT_MS };
+          }
 
-        const restored = yield* self.ensureRuntimeForApproval();
-        if (!restored || !self.engine) {
-          yield* self.deleteExecutionOwnerEntry(executionId);
-          return { status: "execution_expired" as const, ttlMs: PAUSED_APPROVAL_TIMEOUT_MS };
-        }
+          const restored = yield* self.ensureRuntimeForApproval();
+          if (!restored || !self.engine) {
+            yield* self.deleteExecutionOwnerEntry(executionId);
+            return { status: "execution_expired" as const, ttlMs: PAUSED_APPROVAL_TIMEOUT_MS };
+          }
 
-        // This RPC runs outside any MCP request, so nothing else binds the
-        // caller's workspace-write access; without it the resume would rebind
-        // the paused execution to the fail-closed default and deny an admin's
-        // pending write. A caller that predates the field is treated as denied.
-        const orgWriteAccess: OrgWriteAccess =
-          identity.orgWriteAccess === "allowed" ? "allowed" : "denied";
-        const outcome = yield* self
-          .resumeEngineWithLifecycle(executionId, response)
-          .pipe(
-            Effect.provideService(CurrentOrgWriteAccess, makeOrgWriteAccessState(orgWriteAccess)),
-          );
-        if (!outcome) {
-          const alreadySettled = self.engine.isExecutionSettled
-            ? yield* self.engine.isExecutionSettled(executionId)
-            : false;
-          // A settled run's record is what answers later retries; keep it.
-          if (alreadySettled) return { status: "execution_already_settled" } as const;
-          yield* self.deleteExecutionOwnerEntry(executionId);
-          return { status: "execution_expired", ttlMs: PAUSED_APPROVAL_TIMEOUT_MS } as const;
-        }
+          // This RPC runs outside any MCP request, so nothing else binds the
+          // caller's workspace-write access; without it the resume would rebind
+          // the paused execution to the fail-closed default and deny an admin's
+          // pending write. A caller that predates the field is treated as denied.
+          const orgWriteAccess: OrgWriteAccess =
+            identity.orgWriteAccess === "allowed" ? "allowed" : "denied";
+          const outcome = yield* self
+            .resumeEngineWithLifecycle(executionId, response)
+            .pipe(
+              Effect.provideService(CurrentOrgWriteAccess, makeOrgWriteAccessState(orgWriteAccess)),
+            );
+          if (!outcome) {
+            const alreadySettled = self.engine.isExecutionSettled
+              ? yield* self.engine.isExecutionSettled(executionId)
+              : false;
+            // A settled run's record is what answers later retries; keep it.
+            if (alreadySettled) return { status: "execution_already_settled" } as const;
+            yield* self.deleteExecutionOwnerEntry(executionId);
+            return { status: "execution_expired", ttlMs: PAUSED_APPROVAL_TIMEOUT_MS } as const;
+          }
 
-        if (outcome.status === "paused") {
-          const deadline = self.approvalDeadline();
-          const nextId = outcome.execution.id;
-          const recorded = yield* Effect.exit(self.startPendingApprovalLease(nextId, deadline));
-          if (Exit.isFailure(recorded)) {
-            // Never report a pause no other session can find; decline it.
-            const stillPaused = self.engine
-              ? yield* declineUnrecordedPause(self.engine, nextId).pipe(
-                  Effect.provideService(CurrentOrgWriteAccess, makeOrgWriteAccessState("denied")),
-                )
-              : null;
+          if (outcome.status === "paused") {
+            const deadline = self.approvalDeadline();
+            const nextId = outcome.execution.id;
+            const recorded = yield* Effect.exit(self.startPendingApprovalLease(nextId, deadline));
+            if (Exit.isFailure(recorded)) {
+              // Never report a pause no other session can find; decline it.
+              const stillPaused = self.engine
+                ? yield* declineUnrecordedPause(self.engine, nextId).pipe(
+                    Effect.provideService(CurrentOrgWriteAccess, makeOrgWriteAccessState("denied")),
+                  )
+                : null;
+              return {
+                status: "result" as const,
+                result: pauseNotRecordedResult(nextId, stillPaused),
+              };
+            }
             return {
               status: "result" as const,
-              result: pauseNotRecordedResult(nextId, stillPaused),
+              result: formatMcpExecutionOutcome(outcome, { pausedDeadline: deadline }),
             };
           }
+
           return {
             status: "result" as const,
-            result: formatMcpExecutionOutcome(outcome, { pausedDeadline: deadline }),
+            result: formatMcpExecutionOutcome(outcome),
           };
-        }
-
-        return {
-          status: "result" as const,
-          result: formatMcpExecutionOutcome(outcome),
-        };
-      }).pipe(
-        Effect.withSpan("McpSessionDO.resumeExecutionForModel", {
-          attributes: { "mcp.execution.id": executionId },
-        }),
-        (eff) => this.withTelemetry(eff, incoming),
-        // oxlint-disable-next-line executor/no-effect-escape-hatch -- boundary: DO RPC exposes Promise results
-        Effect.orDie,
-        (eff) => self.withSpanFlush(eff),
+        }).pipe(
+          Effect.withSpan("McpSessionDO.resumeExecutionForModel", {
+            attributes: { "mcp.execution.id": executionId },
+          }),
+          (eff) => this.withTelemetry(eff, incoming),
+          // oxlint-disable-next-line executor/no-effect-escape-hatch -- boundary: DO RPC exposes Promise results
+          Effect.orDie,
+          (eff) => self.withSpanFlush(eff),
+        ),
       ),
     );
   }
@@ -1795,31 +1801,33 @@ export abstract class McpAgentSessionDOBase<
     incoming?: IncomingTraceHeaders,
   ): Promise<McpSessionResumeApprovalResult> {
     const self = this;
-    return Effect.runPromise(
-      Effect.gen(function* () {
-        yield* self.prepareErrorCaptureScope();
-        const owner = yield* self.validateApprovalIdentity(identity);
-        if (owner !== "ok") return { status: owner } as const;
+    return this.servingRequest(() =>
+      Effect.runPromise(
+        Effect.gen(function* () {
+          yield* self.prepareErrorCaptureScope();
+          const owner = yield* self.validateApprovalIdentity(identity);
+          if (owner !== "ok") return { status: owner } as const;
 
-        const restored = yield* self.ensureRuntimeForApproval();
-        if (!restored || !self.engine) return { status: "not_found" } as const;
+          const restored = yield* self.ensureRuntimeForApproval();
+          if (!restored || !self.engine) return { status: "not_found" } as const;
 
-        const paused = yield* self.engine.getPausedExecution(executionId);
-        if (!paused) return { status: "not_found" } as const;
+          const paused = yield* self.engine.getPausedExecution(executionId);
+          if (!paused) return { status: "not_found" } as const;
 
-        yield* self.recordApprovalResponse(executionId, {
-          response,
-          orgWriteAccess: identity.orgRole === "admin" ? "allowed" : "denied",
-        });
-        return resumeApprovalResult(executionId, response);
-      }).pipe(
-        Effect.withSpan("McpSessionDO.resumeExecutionForApproval", {
-          attributes: { "mcp.execution.id": executionId },
-        }),
-        (eff) => this.withTelemetry(eff, incoming),
-        // oxlint-disable-next-line executor/no-effect-escape-hatch -- boundary: DO RPC exposes Promise results
-        Effect.orDie,
-        (eff) => self.withSpanFlush(eff),
+          yield* self.recordApprovalResponse(executionId, {
+            response,
+            orgWriteAccess: identity.orgRole === "admin" ? "allowed" : "denied",
+          });
+          return resumeApprovalResult(executionId, response);
+        }).pipe(
+          Effect.withSpan("McpSessionDO.resumeExecutionForApproval", {
+            attributes: { "mcp.execution.id": executionId },
+          }),
+          (eff) => this.withTelemetry(eff, incoming),
+          // oxlint-disable-next-line executor/no-effect-escape-hatch -- boundary: DO RPC exposes Promise results
+          Effect.orDie,
+          (eff) => self.withSpanFlush(eff),
+        ),
       ),
     );
   }
@@ -1828,6 +1836,23 @@ export abstract class McpAgentSessionDOBase<
     this.destroyStarted = true;
     await this.cleanup();
     await super.destroy();
+  }
+
+  /**
+   * Run an approval RPC, counted until its result is ready to hand back (span
+   * flush included). A DELETE-condemned session's alarm will not destroy it
+   * meanwhile: the destroy aborts the isolate, and a forwarded resume would
+   * lose its result after the call already ran. When the last one finishes on
+   * a condemned session, the alarm is re-armed so the destroy runs right after.
+   */
+  private servingRequest<A>(run: () => Promise<A>): Promise<A> {
+    this.requestsInFlight += 1;
+    return run().finally(async () => {
+      this.requestsInFlight -= 1;
+      if (this.requestsInFlight === 0 && (await this.destroyPending())) {
+        await this.ctx.storage.setAlarm(Date.now());
+      }
+    });
   }
 
   private async destroyPending(): Promise<boolean> {
@@ -1857,7 +1882,8 @@ export abstract class McpAgentSessionDOBase<
     // Overdue leases are expired here too, so a lost in-isolate timer cannot
     // hold the session open past its approval window.
     // Only leases still waiting on an answer have a deadline: one being
-    // resumed must settle, and one being expired is already handled.
+    // resumed must settle, and one being expired is already handled. An
+    // approval RPC still returning holds the destroy too (`servingRequest`).
     if (await this.destroyPending()) {
       const waiting = () =>
         Array.from(this.pendingApprovalLeases).filter(
@@ -1870,7 +1896,7 @@ export abstract class McpAgentSessionDOBase<
       await Effect.runPromise(
         Effect.forEach(overdue, (executionId) => this.expirePendingApprovalReported(executionId)),
       );
-      if (this.pendingApprovalLeases.size > 0) {
+      if (this.pendingApprovalLeases.size > 0 || this.requestsInFlight > 0) {
         // A lease still overdue after expiry ran is not a reason to wake early.
         const later = Date.now();
         const upcoming = waiting()
