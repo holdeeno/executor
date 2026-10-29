@@ -1468,10 +1468,16 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
             status: "pause_not_recorded",
             executionId: "exec_1",
           });
-          expect(
-            (result.structuredContent as { stillPausedExecutionId?: string })
-              .stillPausedExecutionId,
-          ).toBe(leftPaused);
+          const structured = result.structuredContent as {
+            stillPausedExecutionId?: string;
+            recovery?: string;
+          };
+          expect(structured.stillPausedExecutionId).toBe(leftPaused);
+          // With a pause still pending, re-running the code is not the advice.
+          expect(structured.recovery).toBe(leftPaused ? undefined : "re_execute");
+          expect(JSON.stringify(result.content).includes("still pending")).toBe(
+            leftPaused !== undefined,
+          );
         },
         {
           elicitationMode: { mode: "model" },

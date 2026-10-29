@@ -230,8 +230,12 @@ const CLOSED_SESSION_LEASE_RECHECK_MS = 30_000;
 const MCP_HTTP_METHOD_HEADER = "cf-mcp-method";
 const MCP_MESSAGE_HEADER = "cf-mcp-message";
 const MODEL_RESUME_FORWARD_TIMEOUT_MS = 10_000;
-/** How long an ended pause's owner record answers late resumes. */
-const ENDED_OWNER_RECORD_TTL_MS = 15 * 60 * 1000;
+/** How long an owner record with an outcome answers late resumes. */
+const OUTCOME_OWNER_RECORD_TTL_MS = 15 * 60 * 1000;
+const outcomeRecordExpiresAt = () =>
+  new Date(Date.now() + OUTCOME_OWNER_RECORD_TTL_MS).toISOString();
+/** Floor for the closed-session alarm, so it can never re-arm in a hot loop. */
+const CLOSED_SESSION_MIN_RECHECK_MS = 1000;
 const approvalResponseKey = (executionId: string) => `approval-response:${executionId}`;
 const BrowserApprovalDecisionStorage = Schema.Struct({
   response: ElicitationResponse,
@@ -1867,9 +1871,13 @@ export abstract class McpAgentSessionDOBase<
         Effect.forEach(overdue, (executionId) => this.expirePendingApprovalReported(executionId)),
       );
       if (this.pendingApprovalLeases.size > 0) {
-        const recheckMs = Date.now() + CLOSED_SESSION_LEASE_RECHECK_MS;
-        const nextExpiryMs = Math.min(recheckMs, ...waiting().map(([, l]) => l.expiresAtMs));
-        await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, nextExpiryMs));
+        // A lease still overdue after expiry ran is not a reason to wake early.
+        const later = Date.now();
+        const upcoming = waiting()
+          .map(([, lease]) => lease.expiresAtMs)
+          .filter((expiresAtMs) => expiresAtMs > later);
+        const nextMs = Math.min(later + CLOSED_SESSION_LEASE_RECHECK_MS, ...upcoming);
+        await this.ctx.storage.setAlarm(Math.max(later + CLOSED_SESSION_MIN_RECHECK_MS, nextMs));
         return;
       }
       await super.alarm();
@@ -1992,10 +2000,7 @@ export abstract class McpAgentSessionDOBase<
         accountId: sessionMeta.userId,
         organizationId: sessionMeta.organizationId,
         ...(outcome
-          ? {
-              outcome,
-              expiresAt: new Date(Date.now() + ENDED_OWNER_RECORD_TTL_MS).toISOString(),
-            }
+          ? { outcome, expiresAt: outcomeRecordExpiresAt() }
           : { expiresAt: deadline.expiresAt }),
         ttlMs: deadline.ttlMs,
       };
@@ -2069,6 +2074,9 @@ export abstract class McpAgentSessionDOBase<
       if (record.outcome === "expired") {
         return { status: "execution_expired", ttlMs: record.ttlMs } as const;
       }
+      // A resume is running in the owner; forwarding would only join or race it.
+      if (record.outcome === "resuming") return { status: "execution_in_progress" } as const;
+      if (record.outcome === "unknown") return { status: "execution_outcome_unknown" } as const;
 
       if (self.sameExecutionOwnerRoute(record.owner, self.executionOwnerRoute())) {
         yield* self.deleteExecutionOwnerEntry(executionId);
@@ -2080,29 +2088,19 @@ export abstract class McpAgentSessionDOBase<
         .pipe(
           Effect.timeoutOrElse({
             duration: `${MODEL_RESUME_FORWARD_TIMEOUT_MS} millis`,
-            // The owner may still be running the resumed call, so this is not
-            // an expiry: keep the record and let the caller resume again.
             orElse: () =>
-              Effect.gen(function* () {
-                yield* self.logModelResumeForwardTimeout({
+              self
+                .logModelResumeForwardTimeout({
                   executionId,
                   owner: record.owner,
                   timeoutMs: MODEL_RESUME_FORWARD_TIMEOUT_MS,
-                });
-                return { status: "execution_in_progress" as const };
-              }),
+                })
+                .pipe(Effect.andThen(self.markOwnerRecordOutcomeUnknown(record))),
           }),
           Effect.catchCause((cause) =>
-            Effect.gen(function* () {
-              yield* self.logModelResumeForwardFailure({
-                executionId,
-                owner: record.owner,
-                cause,
-              });
-              // The failure may have come after the owner ran the call, so
-              // treat it like a timeout: keep the record, let the caller retry.
-              return { status: "execution_in_progress" as const };
-            }),
+            self
+              .logModelResumeForwardFailure({ executionId, owner: record.owner, cause })
+              .pipe(Effect.andThen(self.markOwnerRecordOutcomeUnknown(record))),
           ),
         );
       if (forwarded.status === "execution_expired" || forwarded.status === "execution_not_found") {
@@ -2111,6 +2109,35 @@ export abstract class McpAgentSessionDOBase<
       return forwarded.status === "execution_not_found"
         ? ({ status: "execution_expired", ttlMs: record.ttlMs } as const)
         : forwarded;
+    });
+  }
+
+  /**
+   * A forward to the owner timed out or failed. The owner may still be running
+   * the call, or may have run it before the failure surfaced, so this is not
+   * an expiry: keep the record, marked unknown, and say so to every retry.
+   */
+  private markOwnerRecordOutcomeUnknown(
+    record: McpExecutionOwnerRecord,
+  ): Effect.Effect<{ readonly status: "execution_outcome_unknown" }> {
+    const self = this;
+    return Effect.gen(function* () {
+      const directory = self.executionOwnerDirectory();
+      if (directory) {
+        yield* directory
+          .put({ ...record, outcome: "unknown", expiresAt: outcomeRecordExpiresAt() })
+          .pipe(
+            Effect.tapCause((cause) =>
+              self.logExecutionOwnerDirectoryFailure({
+                operation: "put",
+                executionId: record.executionId,
+                cause,
+              }),
+            ),
+            Effect.ignore,
+          );
+      }
+      return { status: "execution_outcome_unknown" as const };
     });
   }
 
@@ -2187,13 +2214,22 @@ export abstract class McpAgentSessionDOBase<
     );
   }
 
+  /**
+   * The record is re-put as `resuming` with a fresh lifetime: the resumed call
+   * can outlast the pause deadline, and a retry meanwhile must hear "in
+   * progress", not find the record gone and re-execute.
+   */
   private beginPendingApprovalResume(executionId: string): Effect.Effect<void> {
-    return Effect.sync(() => {
-      const lease = this.pendingApprovalLeases.get(executionId);
+    const self = this;
+    return Effect.gen(function* () {
+      const lease = self.pendingApprovalLeases.get(executionId);
       if (!lease || lease.expiring) return;
       if (lease.timeout) clearTimeout(lease.timeout);
       lease.timeout = null;
       lease.resuming = true;
+      yield* self
+        .writeExecutionOwnerEntry(executionId, lease.deadline, "resuming")
+        .pipe(Effect.ignore);
     }).pipe(
       Effect.withSpan("McpSessionDO.pending_approval_lease.begin_resume", {
         attributes: { "mcp.execution.id": executionId },
@@ -2277,10 +2313,12 @@ export abstract class McpAgentSessionDOBase<
     return Effect.gen(function* () {
       yield* self.prepareErrorCaptureScope();
       const lease = self.pendingApprovalLeases.get(executionId);
-      // Not ours to end: gone, already expiring, being resumed, or answered
-      // by the browser (the waiting call resumes with that answer).
+      // Not ours to end: gone, already expiring, being resumed, or answered in
+      // the browser with a call still waiting to resume on that answer. An
+      // answer nobody waits for (the session was DELETEd, or the wait timed
+      // out) is expired like no answer, or the lease would never be freed.
       if (!lease || lease.expiring || lease.resuming) return;
-      if (self.approvalResponses.has(executionId)) return;
+      if (self.approvalResponses.has(executionId) && self.approvalWaiters.has(executionId)) return;
       lease.expiring = true;
       if (lease.timeout) clearTimeout(lease.timeout);
       lease.timeout = null;

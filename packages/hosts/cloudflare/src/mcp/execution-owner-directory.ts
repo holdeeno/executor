@@ -5,7 +5,10 @@ export type McpExecutionOwnerRoute = {
   readonly sessionId: string;
 };
 
-export type McpExecutionOwnerOutcome = "settled" | "expired";
+/** What became of a pause after it stopped waiting: a resume is running, it
+ * resumed to a result, its approval window ran out, or a forward to its owner
+ * failed and nobody knows whether the call ran. */
+export type McpExecutionOwnerOutcome = "resuming" | "settled" | "expired" | "unknown";
 
 export type McpExecutionOwnerRecord = {
   readonly executionId: string;
@@ -14,9 +17,9 @@ export type McpExecutionOwnerRecord = {
   readonly organizationId: string;
   readonly expiresAt: string;
   readonly ttlMs: number;
-  /** Set once the pause ended: resumed to a result, or its approval window
-   * ran out. The record then lives on its own `expiresAt` so a late resume
-   * from any session is answered, never run again. */
+  /** Set once the pause stops waiting. The record then lives on its own
+   * `expiresAt` so a late resume from any session is answered, never run
+   * again. */
   readonly outcome?: McpExecutionOwnerOutcome;
 };
 

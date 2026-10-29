@@ -366,7 +366,8 @@ export type ResumeUnavailableStatus =
   | "execution_expired"
   | "execution_forbidden"
   | "execution_already_settled"
-  | "execution_in_progress";
+  | "execution_in_progress"
+  | "execution_outcome_unknown";
 
 export type ResumeFallbackOutcome =
   | {
@@ -856,6 +857,11 @@ const toMcpFailureResult = (cause: Cause.Cause<unknown>): McpToolResult => {
 const recoveryText =
   "To recover, run the execute tool again with the original code; if it pauses, a fresh executionId will be issued.";
 
+const recoveryByStatus: Partial<Record<ResumeUnavailableStatus, string>> = {
+  execution_in_progress: "retry_resume",
+  execution_outcome_unknown: "check_before_re_execute",
+};
+
 const resumeUnavailableResult = (input: {
   readonly status: ResumeUnavailableStatus;
   readonly executionId: string;
@@ -888,6 +894,11 @@ const resumeUnavailableResult = (input: {
       "Wait a moment, then call resume again with the same executionId.",
       "Do not run execute again; the approved call may already be running.",
     ],
+    execution_outcome_unknown: [
+      `Could not confirm whether the resumed call ran: ${input.executionId}.`,
+      "The owning session did not answer, and it may have run the call.",
+      "Check what ran before re-executing.",
+    ],
   };
   return {
     content: [
@@ -902,7 +913,7 @@ const resumeUnavailableResult = (input: {
       ...(input.status === "execution_expired" ? { ttlMs: windowMs } : {}),
       ...(input.status === "execution_forbidden"
         ? {}
-        : { recovery: input.status === "execution_in_progress" ? "retry_resume" : "re_execute" }),
+        : { recovery: recoveryByStatus[input.status] ?? "re_execute" }),
     },
     isError: true,
   };
@@ -957,17 +968,18 @@ export const pauseNotRecordedResult = (
         `The call paused for approval, but the pause could not be saved: ${executionId}.`,
         "The approval was declined; later steps may have run.",
         ...(stillPausedExecutionId
-          ? [`It then reached another approval that is still pending: ${stillPausedExecutionId}.`]
-          : []),
-        "Check what already ran before running execute again.",
+          ? [
+              `It then reached another approval that is still pending: ${stillPausedExecutionId}.`,
+              "Do not run execute again while that pause is pending.",
+            ]
+          : ["Check what already ran before running execute again."]),
       ].join(" "),
     },
   ],
   structuredContent: {
     status: "pause_not_recorded",
     executionId,
-    recovery: "re_execute",
-    ...(stillPausedExecutionId ? { stillPausedExecutionId } : {}),
+    ...(stillPausedExecutionId ? { stillPausedExecutionId } : { recovery: "re_execute" }),
   },
   isError: true,
 });

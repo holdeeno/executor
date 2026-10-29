@@ -4,6 +4,8 @@ import { vi } from "vitest";
 import { Cause, Effect, Exit } from "effect";
 import {
   CurrentOrgWriteAccess,
+  FormElicitation,
+  ToolAddress,
   currentOrgWriteAccess,
   makeOrgWriteAccessState,
   type OrgWriteAccess,
@@ -17,6 +19,7 @@ import {
 import type {
   ExecutionEngine,
   ExecutionResult,
+  PausedExecution,
   PausedExecutionDeadline,
   ResumeResponse,
 } from "@executor-js/execution";
@@ -323,6 +326,19 @@ const makePausingEngine = (executionId: string, resumeMs = 0) => {
         running.set(id, run);
         return run;
       }),
+    getPausedExecution: (id) =>
+      Effect.sync((): PausedExecution | null =>
+        paused.has(id)
+          ? {
+              id,
+              elicitationContext: {
+                address: ToolAddress.make("tools.test.org.main.t"),
+                args: {},
+                request: FormElicitation.make({ message: "Approve", requestedSchema: {} }),
+              },
+            }
+          : null,
+      ),
     pausedExecutionCount: () => Effect.sync(() => paused.size),
     hasPausedExecutions: () => Effect.sync(() => paused.size > 0),
     isExecutionSettled: (id) => Effect.sync(() => settled.has(id)),
@@ -762,7 +778,7 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     expect(sessionA.activeKeepAlives).toBe(0);
   });
 
-  it("answers a slow owner session forward as in progress and keeps the record", async () => {
+  it("answers a slow owner session forward as outcome unknown and keeps the record", async () => {
     const { directory, namespace } = makeDirectory();
     const requesterEngine = makeEngine(() => null);
     const forward = vi.fn(() => Effect.never);
@@ -781,16 +797,17 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     const pending = sessionB.resumeViaModelTool("exec_timeout", approval);
     await vi.advanceTimersByTimeAsync(10_000);
 
-    // The owner may still be running the resumed call; it is not expired.
-    await expect(pending).resolves.toEqual({ status: "execution_in_progress" });
+    // The owner may or may not have run the call; it is not expired.
+    await expect(pending).resolves.toEqual({ status: "execution_outcome_unknown" });
     expect(forward).toHaveBeenCalledTimes(1);
     expect(await Effect.runPromise(directory.get("exec_timeout"))).toMatchObject({
       executionId: "exec_timeout",
       owner: { sessionId: "session-a" },
+      outcome: "unknown",
     });
   });
 
-  it("answers a failed owner session forward as in progress and keeps the record", async () => {
+  it("answers a failed owner session forward as outcome unknown and keeps the record", async () => {
     const { directory, namespace } = makeDirectory();
     const sessionB = new HarnessSession({
       sessionId: "session-b",
@@ -804,9 +821,14 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     const outcome = await sessionB.resumeViaModelTool("exec_throw", approval);
 
     // The owner may have run the call before the failure reached us.
-    expect(outcome).toEqual({ status: "execution_in_progress" });
+    expect(outcome).toEqual({ status: "execution_outcome_unknown" });
     expect(await Effect.runPromise(directory.get("exec_throw"))).toMatchObject({
       executionId: "exec_throw",
+      outcome: "unknown",
+    });
+    // A retry is told the same, without forwarding again.
+    expect(await sessionB.resumeViaModelTool("exec_throw", approval)).toEqual({
+      status: "execution_outcome_unknown",
     });
   });
 
@@ -915,7 +937,7 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
       await vi.advanceTimersByTimeAsync(30_000);
       await sessionA.fireDueAlarm();
 
-      expect(await first).toEqual({ status: "execution_in_progress" });
+      expect(await first).toEqual({ status: "execution_outcome_unknown" });
       expect(await Effect.runPromise(directory.get("exec_owner"))).toMatchObject({
         outcome: "settled",
       });
@@ -941,6 +963,46 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
 
       await vi.advanceTimersByTimeAsync(1);
       expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toBeNull();
+    });
+
+    it("answers a retry as in progress while a resume runs past the pause deadline", async () => {
+      const { owner, sessionA, newSession } = await setup(5 * 60 * 1000);
+      // The resume runs in the owning session itself, so no forward times out.
+      const running = sessionA.resumeExecutionForModel(
+        "exec_owner",
+        { accountId: "acct_1", organizationId: "org_1", orgWriteAccess: "allowed" },
+        approval,
+      );
+      await vi.advanceTimersByTimeAsync(PAUSED_APPROVAL_TIMEOUT_MS + 30_000);
+
+      const sessionC = newSession("session-c");
+      await sessionC.storeSessionMeta();
+      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toEqual({
+        status: "execution_in_progress",
+      });
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      await expect(running).resolves.toMatchObject({ status: "result" });
+      expect(owner.sideEffects()).toBe(1);
+    });
+
+    it("frees a lease answered in the browser that no waiting call consumes", async () => {
+      const { sessionA } = await setup();
+      // The browser answer is stored, but the call that would have waited for
+      // it is gone with the DELETEd session.
+      await sessionA.resumeExecutionForApproval(
+        "exec_owner",
+        { accountId: "acct_1", organizationId: "org_1", orgRole: "admin" },
+        approval,
+      );
+
+      await vi.advanceTimersByTimeAsync(PAUSED_APPROVAL_TIMEOUT_MS + 1);
+      await sessionA.flushWaitUntil();
+      await sessionA.fireDueAlarm();
+
+      expect(sessionA.pendingLeaseCount()).toBe(0);
+      expect(sessionA.activeKeepAlives).toBe(0);
+      expect(await sessionA.storedSessionMeta()).toBeUndefined();
     });
 
     it("expires an overdue lease from the alarm when its timer never fired", async () => {
