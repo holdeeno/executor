@@ -1,9 +1,13 @@
-import { describe, expect, it } from "@effect/vitest";
+import { afterEach, describe, expect, it } from "@effect/vitest";
+// oxlint-disable-next-line executor/no-vitest-import -- boundary: spies come from vitest itself
+import { vi } from "vitest";
+import { Effect } from "effect";
+import { errors } from "jose";
 
 import { orgWriteAccessForPrincipal } from "@executor-js/host-mcp";
 
 import type { CloudflareConfig } from "../config";
-import { principalFromAccessClaims } from "./cloudflare-access";
+import { makeAccessVerifier, principalFromAccessClaims } from "./cloudflare-access";
 
 const config: CloudflareConfig = {
   accessTeamDomain: "team.cloudflareaccess.com",
@@ -57,5 +61,31 @@ describe("principalFromAccessClaims", () => {
     expect(p.orgRoleModel).toBe("organization");
     expect(p.orgRole).toBe("member");
     expect(orgWriteAccessForPrincipal(p)).toBe("denied");
+  });
+});
+
+describe("makeAccessVerifier signing keys fetch", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("logs a timed-out certs fetch instead of passing it off as a bad token", async () => {
+    const warn = vi.spyOn(console, "warn");
+    const header = btoa(JSON.stringify({ alg: "RS256", kid: "key-1" }));
+    const payload = btoa(JSON.stringify({ sub: "u" }));
+    const { verify } = makeAccessVerifier(config, () =>
+      Effect.runPromise(Effect.fail(new errors.JWKSTimeout())),
+    );
+
+    const principal = await Effect.runPromise(
+      verify(
+        new Request("https://executor.example.com/mcp", {
+          headers: { "Cf-Access-Jwt-Assertion": `${header}.${payload}.c2ln` },
+        }),
+      ),
+    );
+
+    expect(principal).toBeNull();
+    expect(warn.mock.calls.flat().join("\n")).toContain("ERR_JWKS_TIMEOUT");
   });
 });

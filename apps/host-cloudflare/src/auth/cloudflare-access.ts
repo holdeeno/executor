@@ -1,5 +1,5 @@
-import { createRemoteJWKSet, jwtVerify } from "jose";
-import { Effect, Layer } from "effect";
+import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
+import { Effect, Layer, Predicate } from "effect";
 
 import { IdentityProvider, Unauthorized, type Principal } from "@executor-js/api/server";
 
@@ -60,12 +60,13 @@ export const principalFromAccessClaims = (
  *
  * `jose` caches + rotates the team JWKS, so build the verifier once per config.
  */
-export const makeAccessVerifier = (config: CloudflareConfig) => {
+export const makeAccessVerifier = (config: CloudflareConfig, remoteKeys?: JWTVerifyGetKey) => {
   const issuer = `https://${config.accessTeamDomain}`;
-  // Cached, lazily-fetched team signing keys; jose handles rotation + caching.
+  // Cached, lazily-fetched team signing keys; jose handles rotation + caching,
+  // and gives up on a certs fetch after 5s.
   const jwks = config.enableDevAuth
     ? null
-    : createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`));
+    : (remoteKeys ?? createRemoteJWKSet(new URL(`${issuer}/cdn-cgi/access/certs`)));
 
   // Dev/single-user escape hatch: bypass Access entirely, every request is a
   // fixed admin. Only when explicitly enabled (and the instance is otherwise
@@ -93,7 +94,15 @@ export const makeAccessVerifier = (config: CloudflareConfig) => {
 
       const verified = yield* Effect.tryPromise({
         try: () => jwtVerify(token, jwks, { issuer, audience: config.accessAud }),
-        catch: () => "invalid access assertion",
+        catch: (cause) => {
+          // A key fetch failure is ours, not a bad token, yet it also ends in a
+          // 401, so name it for whoever reads the logs.
+          const code = Predicate.hasProperty(cause, "code") ? String(cause.code) : "";
+          if (code.startsWith("ERR_JWKS")) {
+            console.warn(JSON.stringify({ event: "mcp_access_jwks_error", code }));
+          }
+          return "invalid access assertion";
+        },
       }).pipe(Effect.orElseSucceed(() => null));
       if (!verified) return null;
 
