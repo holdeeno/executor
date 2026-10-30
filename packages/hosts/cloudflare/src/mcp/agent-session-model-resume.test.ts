@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "@effect/vitest";
 // oxlint-disable-next-line executor/no-vitest-import -- boundary: vi.mock must come from vitest itself for mock hoisting to resolve
 import { vi } from "vitest";
-import { Cause, Effect, Exit } from "effect";
+import { Cause, Effect, Exit, Option, Schema } from "effect";
 import {
   CurrentOrgWriteAccess,
   FormElicitation,
@@ -15,6 +15,7 @@ import { defaultMcpResource } from "@executor-js/host-mcp";
 import {
   PAUSED_APPROVAL_TIMEOUT_MS,
   formatMcpExecutionOutcome,
+  type McpToolResult,
 } from "@executor-js/host-mcp/tool-server";
 import type {
   ExecutionEngine,
@@ -518,6 +519,24 @@ class HarnessSession extends McpAgentSessionDOBase<Cloudflare.Env, TestDbHandle>
     );
   }
 
+  /** Resume in this session as the tool server does: start, resume the
+   * engine, then settle with the tool's answer. */
+  async resumeLocallyAnswering(
+    executionId: string,
+    response: ResumeResponse,
+    answer: McpToolResult,
+  ): Promise<void> {
+    const hooks = this.pausedExecutionHooks;
+    const engine = this["engine"]!;
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* hooks.onResumeStarted?.(executionId) ?? Effect.void;
+        yield* engine.resume(executionId, response).pipe(Effect.ignore);
+        yield* hooks.onResumeSettled?.(executionId, answer) ?? Effect.void;
+      }),
+    );
+  }
+
   /** Run the Durable Object alarm if it is due, as the platform would. */
   async fireDueAlarm(): Promise<void> {
     await this.fakeState.flushWaitUntil();
@@ -591,6 +610,16 @@ const putOwnerRecord = (
       ...input,
     }),
   );
+
+const decodeLogLine = Schema.decodeUnknownOption(
+  Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
+);
+
+/** The structured log lines a spy saw for one event, parsed. */
+const loggedEvents = (spy: { readonly mock: { readonly calls: unknown[][] } }, event: string) =>
+  spy.mock.calls
+    .flatMap(([line]) => Option.toArray(decodeLogLine(line)))
+    .filter((parsed) => parsed.event === event);
 
 const flushMicrotasks = async (): Promise<void> => {
   await Promise.resolve();
@@ -951,11 +980,21 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     it("does not store a result too large to replay, and answers already settled", async () => {
       const large = "x".repeat(70 * 1024);
       const { owner, newSession, sessionB } = await setup(0, undefined, "lost", large);
+      const warn = vi.spyOn(console, "warn");
 
       const outcome = sessionB.resumeViaModelTool("exec_owner", approval);
       await vi.advanceTimersByTimeAsync(10_000);
 
       expect(await outcome).toEqual({ status: "execution_already_settled" });
+      expect(loggedEvents(warn, "mcp_model_resume_result_not_stored")).toEqual([
+        {
+          event: "mcp_model_resume_result_not_stored",
+          executionId: "exec_owner",
+          reason: "too_large",
+          bytes: expect.any(Number),
+          limitBytes: 64 * 1024,
+        },
+      ]);
       expect(owner.sideEffects()).toBe(1);
       const sessionC = newSession("session-c");
       await sessionC.storeSessionMeta();
@@ -964,6 +1003,39 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
       });
       expect(owner.sideEffects()).toBe(1);
     });
+    it("still frees the lease when a result cannot be serialized, and stores none", async () => {
+      const { directory, owner, sessionA, newSession } = await setup();
+      const warn = vi.spyOn(console, "warn");
+      // A BigInt makes JSON.stringify throw.
+      const unserializable: McpToolResult = {
+        content: [{ type: "text", text: "done" }],
+        structuredContent: { count: BigInt(1) },
+      };
+
+      await sessionA.resumeLocallyAnswering("exec_owner", approval, unserializable);
+
+      expect(sessionA.pendingLeaseCount()).toBe(0);
+      expect(sessionA.activeKeepAlives).toBe(0);
+      expect(owner.sideEffects()).toBe(1);
+      expect(await Effect.runPromise(directory.get("exec_owner"))).toMatchObject({
+        outcome: "settled",
+      });
+      expect(loggedEvents(warn, "mcp_model_resume_result_not_stored")).toEqual([
+        {
+          event: "mcp_model_resume_result_not_stored",
+          executionId: "exec_owner",
+          reason: "serialize_failed",
+          bytes: null,
+          limitBytes: 64 * 1024,
+        },
+      ]);
+      const sessionC = newSession("session-c");
+      await sessionC.storeSessionMeta();
+      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toEqual({
+        status: "execution_already_settled",
+      });
+    });
+
     for (const replyFault of ["lost", "timed_out"] as const) {
       for (const [label, response, result, runs] of [
         ["a decline", decline, "declined", 0],

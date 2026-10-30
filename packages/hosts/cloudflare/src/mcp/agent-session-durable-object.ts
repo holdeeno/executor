@@ -241,8 +241,38 @@ const outcomeRecordExpiresAt = () =>
  * a later resume is told the run already settled instead.
  */
 const MAX_REPLAYED_RESULT_BYTES = 64 * 1024;
-const fitsInOwnerRecord = (result: McpToolResult): boolean =>
-  new TextEncoder().encode(JSON.stringify(result)).byteLength <= MAX_REPLAYED_RESULT_BYTES;
+/**
+ * The result to store for replay, or undefined when it is too large or cannot
+ * be serialized (a BigInt, a cycle). Either way the pause still settles and
+ * its cleanup runs; a later resume is told the run already settled.
+ */
+const replayableResult = (
+  executionId: string,
+  result: McpToolResult,
+): Effect.Effect<McpToolResult | undefined> =>
+  Effect.try({
+    try: () => new TextEncoder().encode(JSON.stringify(result)).byteLength,
+    catch: () => "serialize_failed" as const,
+  }).pipe(
+    Effect.match({
+      onFailure: (reason) => ({ reason, bytes: null }),
+      onSuccess: (bytes) =>
+        bytes <= MAX_REPLAYED_RESULT_BYTES ? null : { reason: "too_large" as const, bytes },
+    }),
+    Effect.map((dropped) => {
+      if (!dropped) return result;
+      console.warn(
+        JSON.stringify({
+          event: "mcp_model_resume_result_not_stored",
+          executionId,
+          reason: dropped.reason,
+          bytes: dropped.bytes,
+          limitBytes: MAX_REPLAYED_RESULT_BYTES,
+        }),
+      );
+      return undefined;
+    }),
+  );
 /**
  * What an owner record answers once its pause stopped waiting, or null while
  * it still waits and the owner must be asked. Never runs the call again.
@@ -2082,6 +2112,7 @@ export abstract class McpAgentSessionDOBase<
     return Effect.gen(function* () {
       const sessionMeta = yield* self.loadSessionMeta();
       if (!sessionMeta) return yield* new McpSessionMetaMissingError();
+      const storedResult = result ? yield* replayableResult(executionId, result) : undefined;
       const record: McpExecutionOwnerRecord = {
         executionId,
         owner: self.executionOwnerRoute(),
@@ -2091,7 +2122,7 @@ export abstract class McpAgentSessionDOBase<
           ? { outcome, expiresAt: outcomeRecordExpiresAt() }
           : { expiresAt: deadline.expiresAt }),
         ttlMs: deadline.ttlMs,
-        ...(result && fitsInOwnerRecord(result) ? { result } : {}),
+        ...(storedResult ? { result: storedResult } : {}),
       };
       yield* directory
         .put(record)
@@ -2408,12 +2439,15 @@ export abstract class McpAgentSessionDOBase<
       if (!lease) return;
       if (lease.timeout) clearTimeout(lease.timeout);
       self.pendingApprovalLeases.delete(executionId);
-      yield* outcome
-        ? self
-            .writeExecutionOwnerEntry(executionId, lease.deadline, outcome, result)
-            .pipe(Effect.ignore)
-        : self.deleteExecutionOwnerEntry(executionId);
-      lease.disposeKeepAlive();
+      // `ensuring`: no throw while writing the record may skip the dispose,
+      // or the lease's keep-alive would hold the session forever.
+      yield* (
+        outcome
+          ? self
+              .writeExecutionOwnerEntry(executionId, lease.deadline, outcome, result)
+              .pipe(Effect.ignore)
+          : self.deleteExecutionOwnerEntry(executionId)
+      ).pipe(Effect.ensuring(Effect.sync(() => lease.disposeKeepAlive())));
     });
   }
 
