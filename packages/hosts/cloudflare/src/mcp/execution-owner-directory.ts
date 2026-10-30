@@ -1,9 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
 import { Data, Effect } from "effect";
+import type { McpToolResult } from "@executor-js/host-mcp/tool-server";
 
 export type McpExecutionOwnerRoute = {
   readonly sessionId: string;
 };
+
+/** What became of a pause after it stopped waiting: a resume is running, it
+ * resumed to a result, its approval window ran out, or a forward to its owner
+ * failed and nobody knows whether the call ran. */
+export type McpExecutionOwnerOutcome = "resuming" | "settled" | "expired" | "unknown";
 
 export type McpExecutionOwnerRecord = {
   readonly executionId: string;
@@ -12,16 +18,27 @@ export type McpExecutionOwnerRecord = {
   readonly organizationId: string;
   readonly expiresAt: string;
   readonly ttlMs: number;
+  /** Set once the pause stops waiting. The record then lives on its own
+   * `expiresAt` so a late resume from any session is answered, never run
+   * again. */
+  readonly outcome?: McpExecutionOwnerOutcome;
+  /** With `settled`: what the owner's resume answered, replayed to a caller
+   * whose reply was lost and to any later resume. Absent when too large. */
+  readonly result?: McpToolResult;
 };
 
 export interface McpExecutionOwnerDirectory {
-  readonly put: (record: McpExecutionOwnerRecord) => Effect.Effect<void, unknown>;
+  /** Stores the record if its outcome may replace the stored one (see
+   * {@link mayReplace}), and answers with the record held afterwards. */
+  readonly put: (
+    record: McpExecutionOwnerRecord,
+  ) => Effect.Effect<McpExecutionOwnerRecord | null, unknown>;
   readonly get: (executionId: string) => Effect.Effect<McpExecutionOwnerRecord | null, unknown>;
   readonly delete: (executionId: string) => Effect.Effect<void, unknown>;
 }
 
 export interface McpExecutionOwnerDirectoryStub {
-  readonly put: (record: McpExecutionOwnerRecord) => Promise<void>;
+  readonly put: (record: McpExecutionOwnerRecord) => Promise<McpExecutionOwnerRecord | null>;
   readonly get: (executionId: string) => Promise<McpExecutionOwnerRecord | null>;
   readonly delete: (executionId: string) => Promise<void>;
 }
@@ -64,6 +81,21 @@ const isOwnerRecord = (value: unknown): value is McpExecutionOwnerRecord =>
 
 const expiryMs = (record: McpExecutionOwnerRecord): number => Date.parse(record.expiresAt);
 
+const outcomeStage = (outcome: McpExecutionOwnerOutcome | undefined): number =>
+  outcome === undefined ? 0 : outcome === "resuming" ? 1 : 2;
+
+/**
+ * Outcomes only move forward: none, then resuming, then settled, expired or
+ * unknown. Settled and expired are final, and unknown never replaces resuming:
+ * a forward that timed out does not know more than the owner that is running
+ * the call. Unknown may still be replaced by settled once the owner finishes.
+ */
+const mayReplace = (stored: McpExecutionOwnerRecord, next: McpExecutionOwnerRecord): boolean => {
+  if (stored.outcome === "settled" || stored.outcome === "expired") return false;
+  if (stored.outcome === "resuming" && next.outcome === "unknown") return false;
+  return outcomeStage(next.outcome) >= outcomeStage(stored.outcome);
+};
+
 export class McpExecutionOwnerDirectoryDO extends DurableObject<unknown> {
   private readonly storage: McpExecutionOwnerDirectoryStorage;
 
@@ -72,11 +104,14 @@ export class McpExecutionOwnerDirectoryDO extends DurableObject<unknown> {
     this.storage = ctx.storage;
   }
 
-  async put(record: McpExecutionOwnerRecord): Promise<void> {
+  async put(record: McpExecutionOwnerRecord): Promise<McpExecutionOwnerRecord | null> {
+    const stored = await this.get(record.executionId);
     const expiresAtMs = expiryMs(record);
-    if (!Number.isFinite(expiresAtMs)) return;
+    if (!Number.isFinite(expiresAtMs)) return stored;
+    if (stored && !mayReplace(stored, record)) return stored;
     await this.storage.put(RECORD_KEY, record);
     await this.storage.setAlarm(expiresAtMs);
+    return record;
   }
 
   async get(executionId: string): Promise<McpExecutionOwnerRecord | null> {

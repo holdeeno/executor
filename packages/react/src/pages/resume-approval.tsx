@@ -281,7 +281,8 @@ export function ResumeApprovalPageView(props: {
             <h1 className="mt-1 text-xl font-semibold text-foreground">Resume execution</h1>
             {!unavailable && (
               <p className="mt-2 text-sm leading-6 text-muted-foreground">
-                A paused tool call is waiting for your decision before it can continue.
+                A paused tool call is waiting for your decision before it can continue. Your
+                decision only takes effect if your agent resumes within a few minutes.
               </p>
             )}
           </div>
@@ -332,7 +333,8 @@ export function ResumeApprovalPageView(props: {
           <div className="mx-5 mb-4 rounded-md border border-border bg-muted px-3 py-2">
             <p className="text-sm font-medium text-foreground">{actionLabel[status.action]} sent</p>
             <p className="mt-1 text-sm text-muted-foreground">
-              Return to your agent and let it continue.
+              Return to your agent and let it continue. Your decision only takes effect if it
+              resumes within a few minutes.
             </p>
           </div>
         )}

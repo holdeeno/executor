@@ -230,6 +230,51 @@ describe("McpExecutionOwnerDirectoryDO", () => {
     expect(storage.alarmAt).toBeNull();
   });
 
+  describe("record outcomes only move forward", () => {
+    const putInOrder = async (
+      ...outcomes: ReadonlyArray<McpExecutionOwnerRecord["outcome"]>
+    ): Promise<McpExecutionOwnerRecord["outcome"]> => {
+      const { directory } = makeDirectory();
+      for (const outcome of outcomes) {
+        await directory.put(record(outcome === undefined ? {} : { outcome }));
+      }
+      return (await directory.get("exec_1"))?.outcome;
+    };
+
+    it("keeps settled when unknown is put after it", async () => {
+      expect(await putInOrder("settled", "unknown")).toBe("settled");
+    });
+
+    it("never overwrites settled or expired", async () => {
+      expect(await putInOrder("settled", "expired")).toBe("settled");
+      expect(await putInOrder("expired", "settled")).toBe("expired");
+      expect(await putInOrder("expired", "resuming")).toBe("expired");
+    });
+
+    it("keeps resuming when unknown is put after it", async () => {
+      expect(await putInOrder("resuming", "unknown")).toBe("resuming");
+    });
+
+    it("never moves back to an earlier outcome", async () => {
+      expect(await putInOrder("resuming", undefined)).toBe("resuming");
+      expect(await putInOrder("unknown", "resuming")).toBe("unknown");
+    });
+
+    it("moves forward from none through resuming to settled", async () => {
+      expect(await putInOrder(undefined, "resuming", "settled")).toBe("settled");
+      expect(await putInOrder(undefined, "unknown", "settled")).toBe("settled");
+    });
+
+    it("answers a put with the record it holds afterwards", async () => {
+      const { directory } = makeDirectory();
+      await directory.put(record({ outcome: "resuming" }));
+
+      expect(await directory.put(record({ outcome: "unknown" }))).toMatchObject({
+        outcome: "resuming",
+      });
+    });
+  });
+
   it("stores, reads, and deletes records through the namespace RPC path", async () => {
     const directory = mcpExecutionOwnerDirectoryFromNamespace(new FakeDirectoryNamespace());
     const entry = record({ executionId: "exec_rpc" });

@@ -1379,11 +1379,13 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
           name: "resume",
           arguments: { executionId: "exec_1", action: "accept", content: "{}" },
         });
+        // The follow-up pause is recorded before the resume that reached it
+        // settles, and the settle hook gets the answer for replay.
         expect(events).toEqual([
           "pause:exec_1",
           "resume-start:exec_1",
-          "resume-settle:exec_1",
           "pause:exec_2",
+          "resume-settle:exec_1:waiting_for_interaction",
         ]);
       },
       {
@@ -1393,12 +1395,103 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
             Effect.sync(() => events.push(`pause:${executionId}`)),
           onResumeStarted: (executionId) =>
             Effect.sync(() => events.push(`resume-start:${executionId}`)),
-          onResumeSettled: (executionId) =>
-            Effect.sync(() => events.push(`resume-settle:${executionId}`)),
+          onResumeSettled: (executionId, result) =>
+            Effect.sync(() =>
+              events.push(
+                `resume-settle:${executionId}:${String(result?.structuredContent?.status ?? "none")}`,
+              ),
+            ),
         },
       },
     );
   });
+
+  it("cancels a pause the host could not record instead of reporting it", async () => {
+    const resumes: Array<{ executionId: string; action: string }> = [];
+    const approval = FormElicitation.make({ message: "Approve", requestedSchema: {} });
+    const engine = makeStubEngine({
+      executeWithPause: () => Effect.succeed(makePausedResult("exec_1", approval)),
+      resume: (executionId, response) =>
+        Effect.sync(() => {
+          resumes.push({ executionId, action: response.action });
+          return { status: "completed", result: { result: "declined" } };
+        }),
+    });
+
+    await withClient(
+      engine,
+      NO_CAPS,
+      async (client) => {
+        const result = await client.callTool({ name: "execute", arguments: { code: "pause" } });
+
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          status: "pause_not_recorded",
+          executionId: "exec_1",
+        });
+        expect(resumes).toEqual([{ executionId: "exec_1", action: "decline" }]);
+        expect(JSON.stringify(result.content)).toContain(
+          "The approval was declined; later steps may have run.",
+        );
+      },
+      {
+        elicitationMode: { mode: "model" },
+        pausedExecutionHooks: {
+          onExecutionPaused: () => Effect.fail("directory unavailable"),
+        },
+      },
+    );
+  });
+
+  for (const [label, pausesAfterDecline, expectedDeclines, leftPaused] of [
+    ["declines the follow-up pause too", 1, 2, undefined],
+    ["stops declining after a few follow-up pauses and reports the last", 99, 3, "exec_4"],
+  ] as const) {
+    it(`when canceling an unrecorded pause, ${label}`, async () => {
+      const declined: string[] = [];
+      const approval = FormElicitation.make({ message: "Approve", requestedSchema: {} });
+      const engine = makeStubEngine({
+        executeWithPause: () => Effect.succeed(makePausedResult("exec_1", approval)),
+        resume: (executionId) =>
+          Effect.sync(() => {
+            declined.push(executionId);
+            return declined.length <= pausesAfterDecline
+              ? makePausedResult(`exec_${declined.length + 1}`, approval)
+              : { status: "completed", result: { result: "done" } };
+          }),
+      });
+
+      await withClient(
+        engine,
+        NO_CAPS,
+        async (client) => {
+          const result = await client.callTool({ name: "execute", arguments: { code: "pause" } });
+
+          expect(result.isError).toBe(true);
+          expect(declined).toHaveLength(expectedDeclines);
+          expect(declined[0]).toBe("exec_1");
+          expect(result.structuredContent).toMatchObject({
+            status: "pause_not_recorded",
+            executionId: "exec_1",
+          });
+          const structured = result.structuredContent as {
+            stillPausedExecutionId?: string;
+            recovery?: string;
+          };
+          expect(structured.stillPausedExecutionId).toBe(leftPaused);
+          // With a pause still pending, re-running the code is not the advice.
+          expect(structured.recovery).toBe(leftPaused ? undefined : "re_execute");
+          expect(JSON.stringify(result.content).includes("still pending")).toBe(
+            leftPaused !== undefined,
+          );
+        },
+        {
+          elicitationMode: { mode: "model" },
+          pausedExecutionHooks: { onExecutionPaused: () => Effect.fail("directory unavailable") },
+        },
+      );
+    });
+  }
 
   it("resume tool passes parsed content to engine", async () => {
     let receivedContent: Record<string, unknown> | undefined;
