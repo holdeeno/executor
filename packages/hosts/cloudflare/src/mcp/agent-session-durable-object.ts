@@ -33,6 +33,7 @@ import {
 } from "@executor-js/sdk";
 
 import type { IncomingPropagationHeaders, McpElicitationMode } from "./do-headers";
+import { describeCause, summarizeErrorDetail } from "./describe-error";
 import { classifyDurableObjectError, type DurableObjectFailure } from "./durable-object-errors";
 import type {
   McpExecutionOwnerDirectory,
@@ -1302,14 +1303,18 @@ export abstract class McpAgentSessionDOBase<
     readonly executionId: string;
     readonly owner: McpExecutionOwnerRoute;
     readonly cause: Cause.Cause<unknown>;
+    readonly elapsedMs: number;
   }): Effect.Effect<void> {
     const self = this;
     return Effect.gen(function* () {
+      const errorDetail = describeCause(input.cause);
       console.error(
         JSON.stringify({
           event: "mcp_model_resume_forward_error",
           reason: "error",
-          error: Cause.prettyErrors(input.cause)[0]?.message ?? "unknown",
+          error: summarizeErrorDetail(errorDetail),
+          errorDetail,
+          elapsedMs: input.elapsedMs,
           executionId: input.executionId,
           sessionId: self.sessionIdForTelemetry(),
           ownerSessionId: input.owner.sessionId,
@@ -2214,6 +2219,7 @@ export abstract class McpAgentSessionDOBase<
         return { status: "execution_expired", ttlMs: record.ttlMs } as const;
       }
 
+      const forwardStartedAt = Date.now();
       const forwarded = yield* self
         .forwardModelResumeToOwner(record.owner, identity, executionId, response)
         .pipe(
@@ -2230,7 +2236,12 @@ export abstract class McpAgentSessionDOBase<
           }),
           Effect.catchCause((cause) =>
             self
-              .logModelResumeForwardFailure({ executionId, owner: record.owner, cause })
+              .logModelResumeForwardFailure({
+                executionId,
+                owner: record.owner,
+                cause,
+                elapsedMs: Date.now() - forwardStartedAt,
+              })
               .pipe(Effect.as(null)),
           ),
         );
