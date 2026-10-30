@@ -81,8 +81,9 @@ const isOwnerRecord = (value: unknown): value is McpExecutionOwnerRecord =>
 
 const expiryMs = (record: McpExecutionOwnerRecord): number => Date.parse(record.expiresAt);
 
+const FINAL_OUTCOME_STAGE = 2;
 const outcomeStage = (outcome: McpExecutionOwnerOutcome | undefined): number =>
-  outcome === undefined ? 0 : outcome === "resuming" ? 1 : 2;
+  outcome === undefined ? 0 : outcome === "resuming" ? 1 : FINAL_OUTCOME_STAGE;
 
 /**
  * Outcomes only move forward: none, then resuming, then settled, expired or
@@ -119,19 +120,31 @@ export class McpExecutionOwnerDirectoryDO extends DurableObject<unknown> {
     if (!isOwnerRecord(stored) || stored.executionId !== executionId) return null;
     const expiresAtMs = expiryMs(stored);
     if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
-      await this.delete(executionId);
+      await this.remove();
       return null;
     }
     return stored;
   }
 
+  /**
+   * A record whose outcome is final stays until it expires. A stale forward
+   * can land on a destroyed owner, which answers "expired"; deleting on that
+   * would tell the next retry the run is unknown and to run it again.
+   */
   async delete(executionId: string): Promise<void> {
     const stored = await this.storage.get<unknown>(RECORD_KEY);
-    if (isOwnerRecord(stored) && stored.executionId !== executionId) return;
-    await Promise.all([this.storage.delete(RECORD_KEY), this.storage.deleteAlarm()]);
+    if (isOwnerRecord(stored)) {
+      if (stored.executionId !== executionId) return;
+      if (outcomeStage(stored.outcome) === FINAL_OUTCOME_STAGE) return;
+    }
+    await this.remove();
   }
 
   override async alarm(): Promise<void> {
+    await this.remove();
+  }
+
+  private async remove(): Promise<void> {
     await Promise.all([this.storage.delete(RECORD_KEY), this.storage.deleteAlarm()]);
   }
 }

@@ -537,6 +537,13 @@ class HarnessSession extends McpAgentSessionDOBase<Cloudflare.Env, TestDbHandle>
     );
   }
 
+  /** Start a resume in this session, as the tool server does. */
+  async reportResumeStarted(executionId: string): Promise<void> {
+    await Effect.runPromise(
+      this.pausedExecutionHooks.onResumeStarted?.(executionId) ?? Effect.void,
+    );
+  }
+
   /** Report how a resume was answered in this session, as the tool server does. */
   async reportResumeAnswered(
     executionId: string,
@@ -933,6 +940,22 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     const routeLines = (info: { readonly mock: { readonly calls: unknown[][] } }) =>
       loggedEvents(info, "mcp_model_resume_route");
 
+    it("logs when a resume starts, so one that never answers can be seen", async () => {
+      const { namespace } = makeDirectory();
+      const session = new HarnessSession({
+        sessionId: "session-b",
+        engine: makeEngine(() => null).engine,
+        directoryNamespace: namespace,
+      });
+      const info = vi.spyOn(console, "info");
+
+      await session.reportResumeStarted("exec_started");
+
+      expect(loggedEvents(info, "mcp_model_resume_start")).toEqual([
+        expect.objectContaining({ executionId: "exec_started" }),
+      ]);
+    });
+
     it("logs a resume with no owner record", async () => {
       const { namespace } = makeDirectory();
       const session = new HarnessSession({
@@ -1155,7 +1178,7 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
 
       const sessionB = newSession("session-b");
       await sessionB.storeSessionMeta();
-      return { directory, owner, sessionA, sessionB, newSession };
+      return { directory, namespace, owner, sessionA, sessionB, newSession };
     };
 
     const decline = { action: "decline" } satisfies ResumeResponse;
@@ -1186,6 +1209,78 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
         expect(await sessionA.storedSessionMeta()).toBeUndefined();
       });
     }
+
+    describe("a retry after the client's first resume hung", () => {
+      for (const [label, response, result, runs] of [
+        ["a decline", decline, "declined", 0],
+        ["an approval", approval, "owner-result", 1],
+      ] as const) {
+        it(`replays ${label} when the reply was lost on the way to the client`, async () => {
+          const { owner, sessionB, newSession } = await setup();
+          // The caller got its answer; the client never saw it and timed out.
+          await sessionB.resumeViaModelTool("exec_owner", response);
+
+          await vi.advanceTimersByTimeAsync(76_000);
+          const sessionC = newSession("session-c");
+          await sessionC.storeSessionMeta();
+
+          expect(await sessionC.resumeViaModelTool("exec_owner", response)).toMatchObject(
+            settledWith(result),
+          );
+          expect(owner.sideEffects()).toBe(runs);
+        });
+      }
+
+      it("runs an approval once when the hung forward lands after the retry", async () => {
+        const { directory, namespace, owner, sessionA, newSession } = await setup(0, {
+          flushMs: 0,
+        });
+        let release: () => void = () => undefined;
+        const landed = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        // The first resume stalls before it reaches the owner.
+        const hungCaller = new HarnessSession({
+          sessionId: "session-b",
+          engine: makeEngine(() => null).engine,
+          directoryNamespace: namespace,
+          forwardModelResumeToOwner: (_route, identity, executionId, response) =>
+            Effect.promise(async () => {
+              await landed;
+              return sessionA.resumeExecutionForModel(executionId, identity, response);
+            }),
+        });
+        await hungCaller.storeSessionMeta();
+        const hung = hungCaller.resumeViaModelTool("exec_owner", approval);
+        await vi.advanceTimersByTimeAsync(100);
+
+        // The client gives up and retries: this one does the work.
+        const sessionC = newSession("session-c");
+        await sessionC.storeSessionMeta();
+        expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toMatchObject(
+          settledWith("owner-result"),
+        );
+        expect(owner.sideEffects()).toBe(1);
+
+        // The owner is destroyed, and only then does the stale forward land.
+        await vi.advanceTimersByTimeAsync(6000);
+        expect(await sessionA.storedSessionMeta()).toBeUndefined();
+        release();
+        await vi.advanceTimersByTimeAsync(1);
+        await hung;
+
+        expect(owner.sideEffects()).toBe(1);
+        expect(await Effect.runPromise(directory.get("exec_owner"))).toMatchObject({
+          outcome: "settled",
+        });
+        const sessionD = newSession("session-d");
+        await sessionD.storeSessionMeta();
+        expect(await sessionD.resumeViaModelTool("exec_owner", approval)).toMatchObject(
+          settledWith("owner-result"),
+        );
+        expect(owner.sideEffects()).toBe(1);
+      });
+    });
 
     it("does not let an SDK alarm re-arm cut the reply's grace period short", async () => {
       const { sessionA, sessionB } = await setup(0, { flushMs: 0, replyMs: 20 });

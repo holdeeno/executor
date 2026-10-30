@@ -723,7 +723,18 @@ export abstract class McpAgentSessionDOBase<
     // session right after that answer, and a teardown cancels queued work.
     onExecutionPaused: (executionId, deadline) =>
       this.startPendingApprovalLease(executionId, deadline),
-    onResumeStarted: (executionId) => this.beginPendingApprovalResume(executionId),
+    // Paired with the route line: a start with no route never got an answer,
+    // and no start at all means the call never reached this tool.
+    onResumeStarted: (executionId) =>
+      Effect.sync(() => {
+        console.info(
+          JSON.stringify({
+            event: "mcp_model_resume_start",
+            executionId,
+            sessionId: this.sessionIdForTelemetry(),
+          }),
+        );
+      }).pipe(Effect.andThen(this.beginPendingApprovalResume(executionId))),
     onResumeSettled: (executionId, result) => this.finishPendingApprovalResume(executionId, result),
     onResumeAnswered: (executionId, path, answer) =>
       Effect.sync(() => {

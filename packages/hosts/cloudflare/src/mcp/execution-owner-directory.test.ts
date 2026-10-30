@@ -265,6 +265,31 @@ describe("McpExecutionOwnerDirectoryDO", () => {
       expect(await putInOrder(undefined, "unknown", "settled")).toBe("settled");
     });
 
+    it("keeps a record with a final outcome through a delete until it expires", async () => {
+      for (const outcome of ["settled", "expired", "unknown"] as const) {
+        const { directory, storage } = makeDirectory();
+        const entry = record({ outcome });
+        await directory.put(entry);
+
+        await directory.delete("exec_1");
+
+        expect(await directory.get("exec_1")).toEqual(entry);
+        await directory.alarm();
+        expect(await storage.get("owner")).toBeUndefined();
+      }
+    });
+
+    it("still deletes a record that has not ended", async () => {
+      for (const outcome of [undefined, "resuming"] as const) {
+        const { directory } = makeDirectory();
+        await directory.put(record(outcome === undefined ? {} : { outcome }));
+
+        await directory.delete("exec_1");
+
+        expect(await directory.get("exec_1")).toBeNull();
+      }
+    });
+
     it("answers a put with the record it holds afterwards", async () => {
       const { directory } = makeDirectory();
       await directory.put(record({ outcome: "resuming" }));
