@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { Data, Effect } from "effect";
+import type { McpToolResult } from "@executor-js/host-mcp/tool-server";
 
 export type McpExecutionOwnerRoute = {
   readonly sessionId: string;
@@ -21,6 +22,9 @@ export type McpExecutionOwnerRecord = {
    * `expiresAt` so a late resume from any session is answered, never run
    * again. */
   readonly outcome?: McpExecutionOwnerOutcome;
+  /** With `settled`: what the owner's resume answered, replayed to a caller
+   * whose reply was lost and to any later resume. Absent when too large. */
+  readonly result?: McpToolResult;
 };
 
 export interface McpExecutionOwnerDirectory {

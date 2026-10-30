@@ -320,7 +320,7 @@ const makeEngine = (
 /** An engine holding one live pause, like the real one: resuming runs the
  * paused tool call once, a resume that lands while it runs joins it, and the
  * id is then remembered as settled. `resumeMs` is how long the call runs. */
-const makePausingEngine = (executionId: string, resumeMs = 0) => {
+const makePausingEngine = (executionId: string, resumeMs = 0, acceptedResult = "owner-result") => {
   // Only an approval runs the paused call; a decline completes without it.
   const paused = new Set([executionId]);
   const settled = new Set<string>();
@@ -340,7 +340,7 @@ const makePausingEngine = (executionId: string, resumeMs = 0) => {
           const finish = () => {
             settled.add(id);
             running.delete(id);
-            resolve(completed(accepted ? "owner-result" : "declined"));
+            resolve(completed(accepted ? acceptedResult : "declined"));
           };
           if (resumeMs === 0) finish();
           else setTimeout(finish, resumeMs);
@@ -367,6 +367,12 @@ const makePausingEngine = (executionId: string, resumeMs = 0) => {
   };
   return { engine: pausingEngine, sideEffects: () => sideEffects };
 };
+
+/** What a resume answers with once the owner settled the call to `result`. */
+const settledWith = (result: string) => ({
+  status: "result",
+  result: { structuredContent: { status: "completed", result } },
+});
 
 const sessionMeta = (input?: Partial<SessionMeta>): SessionMeta => ({
   organizationId: "org_1",
@@ -879,9 +885,15 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
   });
 
   describe("after the client DELETEs the owning session", () => {
-    const setup = async (resumeMs = 0, live?: { readonly flushMs: number }) => {
+    const setup = async (
+      resumeMs = 0,
+      live?: { readonly flushMs: number },
+      // The owner answers, but its reply never reaches the caller.
+      replyFault?: "lost" | "timed_out",
+      acceptedResult?: string,
+    ) => {
       const { directory, namespace } = makeDirectory();
-      const owner = makePausingEngine("exec_owner", resumeMs);
+      const owner = makePausingEngine("exec_owner", resumeMs, acceptedResult);
       const sessions = new Map<string, HarnessSession>();
       const sessionNamespace = {
         idFromName: (name: string) => name,
@@ -908,6 +920,14 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
                 ),
                 sessions.get(mcpSessionDurableObjectName(route.sessionId))!.aborted(),
               ]),
+            ).pipe(
+              Effect.andThen((reply) =>
+                replyFault === "lost"
+                  ? Effect.fail("reply lost")
+                  : replyFault === "timed_out"
+                    ? Effect.never
+                    : Effect.succeed(reply),
+              ),
             ),
         });
       const sessionA = newSession("session-a", owner.engine, live);
@@ -927,6 +947,46 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     };
 
     const decline = { action: "decline" } satisfies ResumeResponse;
+
+    it("does not store a result too large to replay, and answers already settled", async () => {
+      const large = "x".repeat(70 * 1024);
+      const { owner, newSession, sessionB } = await setup(0, undefined, "lost", large);
+
+      const outcome = sessionB.resumeViaModelTool("exec_owner", approval);
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(await outcome).toEqual({ status: "execution_already_settled" });
+      expect(owner.sideEffects()).toBe(1);
+      const sessionC = newSession("session-c");
+      await sessionC.storeSessionMeta();
+      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toEqual({
+        status: "execution_already_settled",
+      });
+      expect(owner.sideEffects()).toBe(1);
+    });
+    for (const replyFault of ["lost", "timed_out"] as const) {
+      for (const [label, response, result, runs] of [
+        ["a decline", decline, "declined", 0],
+        ["an approval", approval, "owner-result", 1],
+      ] as const) {
+        it(`returns the settled result of ${label} when the owner's reply is ${replyFault}`, async () => {
+          const { owner, newSession, sessionB } = await setup(0, undefined, replyFault);
+
+          const outcome = sessionB.resumeViaModelTool("exec_owner", response);
+          await vi.advanceTimersByTimeAsync(10_000);
+
+          expect(await outcome).toMatchObject(settledWith(result));
+          expect(owner.sideEffects()).toBe(runs);
+
+          const sessionC = newSession("session-c");
+          await sessionC.storeSessionMeta();
+          expect(await sessionC.resumeViaModelTool("exec_owner", response)).toMatchObject(
+            settledWith(result),
+          );
+          expect(owner.sideEffects()).toBe(runs);
+        });
+      }
+    }
     for (const [label, response, result, runs] of [
       ["returns the declined result and runs nothing", decline, "declined", 0],
       ["returns the call's result and runs it once", approval, "owner-result", 1],
@@ -949,9 +1009,9 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
 
         const sessionC = newSession("session-c");
         await sessionC.storeSessionMeta();
-        expect(await sessionC.resumeViaModelTool("exec_owner", response)).toEqual({
-          status: "execution_already_settled",
-        });
+        expect(await sessionC.resumeViaModelTool("exec_owner", response)).toMatchObject(
+          settledWith(result),
+        );
         expect(owner.sideEffects()).toBe(runs);
       });
     }
@@ -987,13 +1047,13 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
 
       const sessionD = newSession("session-d");
       await sessionD.storeSessionMeta();
-      expect(await sessionD.resumeViaModelTool("exec_owner", approval)).toEqual({
-        status: "execution_already_settled",
-      });
+      expect(await sessionD.resumeViaModelTool("exec_owner", approval)).toMatchObject(
+        settledWith("owner-result"),
+      );
       expect(owner.sideEffects()).toBe(1);
     });
 
-    it("answers a second resume as already settled without running the call again", async () => {
+    it("replays the settled result to a second resume without running the call again", async () => {
       const { owner, sessionA, sessionB, newSession } = await setup();
       await sessionB.resumeViaModelTool("exec_owner", approval);
       // The resume released the lease, so the deferred destroy now runs.
@@ -1005,7 +1065,7 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
       await sessionC.storeSessionMeta();
       const retry = await sessionC.resumeViaModelTool("exec_owner", approval);
 
-      expect(retry).toEqual({ status: "execution_already_settled" });
+      expect(retry).toMatchObject(settledWith("owner-result"));
       expect(owner.sideEffects()).toBe(1);
     });
 
@@ -1030,13 +1090,13 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
       });
       const sessionC = newSession("session-c");
       await sessionC.storeSessionMeta();
-      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toEqual({
-        status: "execution_already_settled",
-      });
+      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toMatchObject(
+        settledWith("owner-result"),
+      );
       expect(owner.sideEffects()).toBe(1);
     });
 
-    it("answers late retries as settled for 15 minutes, then forgets the run", async () => {
+    it("replays the settled result to late retries for 15 minutes, then forgets the run", async () => {
       const { sessionA, sessionB, newSession } = await setup();
       await sessionB.resumeViaModelTool("exec_owner", approval);
       await sessionA.fireDueAlarm();
@@ -1044,9 +1104,9 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
       await sessionC.storeSessionMeta();
 
       await vi.advanceTimersByTimeAsync(15 * 60 * 1000 - 1);
-      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toEqual({
-        status: "execution_already_settled",
-      });
+      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toMatchObject(
+        settledWith("owner-result"),
+      );
 
       await vi.advanceTimersByTimeAsync(1);
       expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toBeNull();
@@ -1066,9 +1126,9 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
       });
 
       await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
-      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toEqual({
-        status: "execution_already_settled",
-      });
+      expect(await sessionC.resumeViaModelTool("exec_owner", approval)).toMatchObject(
+        settledWith("owner-result"),
+      );
       expect(owner.sideEffects()).toBe(1);
     });
 

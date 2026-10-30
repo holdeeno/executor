@@ -1379,11 +1379,13 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
           name: "resume",
           arguments: { executionId: "exec_1", action: "accept", content: "{}" },
         });
+        // The follow-up pause is recorded before the resume that reached it
+        // settles, and the settle hook gets the answer for replay.
         expect(events).toEqual([
           "pause:exec_1",
           "resume-start:exec_1",
-          "resume-settle:exec_1",
           "pause:exec_2",
+          "resume-settle:exec_1:waiting_for_interaction",
         ]);
       },
       {
@@ -1393,8 +1395,12 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
             Effect.sync(() => events.push(`pause:${executionId}`)),
           onResumeStarted: (executionId) =>
             Effect.sync(() => events.push(`resume-start:${executionId}`)),
-          onResumeSettled: (executionId) =>
-            Effect.sync(() => events.push(`resume-settle:${executionId}`)),
+          onResumeSettled: (executionId, result) =>
+            Effect.sync(() =>
+              events.push(
+                `resume-settle:${executionId}:${String(result?.structuredContent?.status ?? "none")}`,
+              ),
+            ),
         },
       },
     );
