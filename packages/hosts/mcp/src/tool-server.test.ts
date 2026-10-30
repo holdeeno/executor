@@ -1406,6 +1406,43 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
     );
   });
 
+  it("reports how a resume was answered in this session", async () => {
+    const answered: string[] = [];
+    const settledIds = new Set(["exec_settled"]);
+    const engine = makeStubEngine({
+      resume: (executionId) =>
+        Effect.succeed(
+          executionId === "exec_live" ? { status: "completed", result: { result: "ok" } } : null,
+        ),
+      isExecutionSettled: (executionId) => Effect.succeed(settledIds.has(executionId)),
+    });
+
+    await withClient(
+      engine,
+      NO_CAPS,
+      async (client) => {
+        for (const executionId of ["exec_live", "exec_settled", "exec_elsewhere"]) {
+          await client.callTool({
+            name: "resume",
+            arguments: { executionId, action: "accept", content: "{}" },
+          });
+        }
+        // A resume this session cannot answer is the host's fallback to report.
+        expect(answered).toEqual([
+          "exec_live:local:completed",
+          "exec_settled:local_settled:execution_already_settled",
+        ]);
+      },
+      {
+        elicitationMode: { mode: "model" },
+        pausedExecutionHooks: {
+          onResumeAnswered: (executionId, path, answer) =>
+            Effect.sync(() => answered.push(`${executionId}:${path}:${answer}`)),
+        },
+      },
+    );
+  });
+
   it("cancels a pause the host could not record instead of reporting it", async () => {
     const resumes: Array<{ executionId: string; action: string }> = [];
     const approval = FormElicitation.make({ message: "Approve", requestedSchema: {} });

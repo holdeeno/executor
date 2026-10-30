@@ -361,6 +361,13 @@ export type PausedExecutionHooks = {
   /** `result` is what the resume answered with, when this engine resumed the
    * execution, so a host can replay it to a later resume of the same id. */
   readonly onResumeSettled?: (executionId: string, result?: McpToolResult) => Effect.Effect<void>;
+  /** A `resume` this session answered itself, for the host to log. A resume it
+   * cannot answer goes to `resumeFallback` instead. */
+  readonly onResumeAnswered?: (
+    executionId: string,
+    path: "local" | "local_settled",
+    answer: string,
+  ) => Effect.Effect<void>;
 };
 
 export type ResumeUnavailableStatus =
@@ -1685,6 +1692,16 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
       config.pausedExecutionHooks?.onResumeStarted?.(executionId) ?? Effect.void;
     const onResumeSettled = (executionId: string, result?: McpToolResult): Effect.Effect<void> =>
       config.pausedExecutionHooks?.onResumeSettled?.(executionId, result) ?? Effect.void;
+    const onResumeAnswered = (
+      executionId: string,
+      path: "local" | "local_settled",
+      answer: string,
+    ): Effect.Effect<void> =>
+      config.pausedExecutionHooks?.onResumeAnswered?.(executionId, path, answer) ?? Effect.void;
+    const answerStatus = (result: McpToolResult): string => {
+      const status = result.structuredContent?.status;
+      return typeof status === "string" ? status : "unknown";
+    };
     /** Resume, then `present` the outcome as the tool's answer. The answer is
      * handed to `onResumeSettled` when this engine resumed the execution. */
     const resumeWithLifecycle = <EP>(
@@ -1697,7 +1714,10 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         yield* onResumeStarted(executionId);
         const outcome = yield* engine.resume(executionId, response);
         const result = yield* present(outcome);
-        if (outcome) settled = result;
+        if (outcome) {
+          settled = result;
+          yield* onResumeAnswered(executionId, "local", answerStatus(result));
+        }
         return result;
       }).pipe(Effect.ensuring(Effect.suspend(() => onResumeSettled(executionId, settled))));
     };
@@ -1970,7 +1990,9 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
             if (!outcome) {
               debugLog("resume.missing_execution", { executionId });
               if (yield* localExecutionAlreadySettled(executionId)) {
-                return alreadySettledResult(executionId);
+                const answer = alreadySettledResult(executionId);
+                yield* onResumeAnswered(executionId, "local_settled", answerStatus(answer));
+                return answer;
               }
               const fallback = yield* resumeFallback(executionId, response);
               if (fallback) {
