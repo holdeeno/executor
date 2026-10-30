@@ -537,6 +537,22 @@ class HarnessSession extends McpAgentSessionDOBase<Cloudflare.Env, TestDbHandle>
     );
   }
 
+  /** Report how a resume was answered in this session, as the tool server does. */
+  async reportResumeAnswered(
+    executionId: string,
+    path: "local" | "local_settled",
+    answer: string,
+  ): Promise<void> {
+    await Effect.runPromise(
+      this.pausedExecutionHooks.onResumeAnswered?.(executionId, path, answer) ?? Effect.void,
+    );
+  }
+
+  /** Re-arm the alarm for now, as the SDK does whenever a destroy is pending. */
+  async sdkRearmsAlarmNow(): Promise<void> {
+    await this.fakeState.storage.setAlarm(Date.now());
+  }
+
   /** Run the Durable Object alarm if it is due, as the platform would. */
   async fireDueAlarm(): Promise<void> {
     await this.fakeState.flushWaitUntil();
@@ -913,6 +929,103 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     });
   });
 
+  describe("logs one route line for every path a resume can take", () => {
+    const routeLines = (info: { readonly mock: { readonly calls: unknown[][] } }) =>
+      loggedEvents(info, "mcp_model_resume_route");
+
+    it("logs a resume with no owner record", async () => {
+      const { namespace } = makeDirectory();
+      const session = new HarnessSession({
+        sessionId: "session-b",
+        engine: makeEngine(() => null).engine,
+        directoryNamespace: namespace,
+      });
+      await session.storeSessionMeta();
+      const info = vi.spyOn(console, "info");
+
+      expect(await session.resumeViaModelTool("exec_missing", approval)).toBeNull();
+
+      expect(routeLines(info)).toEqual([
+        expect.objectContaining({
+          executionId: "exec_missing",
+          path: "no_record",
+          answer: "execution_not_found",
+          recordOutcome: null,
+          ownerSessionId: null,
+        }),
+      ]);
+    });
+
+    it("logs a resume refused for another identity", async () => {
+      const { directory, namespace } = makeDirectory();
+      const session = new HarnessSession({
+        sessionId: "session-b",
+        meta: sessionMeta({ organizationId: "org_other" }),
+        engine: makeEngine(() => null).engine,
+        directoryNamespace: namespace,
+      });
+      await session.storeSessionMeta();
+      await putOwnerRecord(directory, { executionId: "exec_foreign" });
+      const info = vi.spyOn(console, "info");
+
+      await session.resumeViaModelTool("exec_foreign", approval);
+
+      expect(routeLines(info)).toEqual([
+        expect.objectContaining({
+          executionId: "exec_foreign",
+          path: "forbidden",
+          answer: "execution_forbidden",
+          ownerSessionId: "session-a",
+        }),
+      ]);
+    });
+
+    it("logs a record that points back at this session", async () => {
+      const { directory, namespace } = makeDirectory();
+      const session = new HarnessSession({
+        sessionId: "session-b",
+        engine: makeEngine(() => null).engine,
+        directoryNamespace: namespace,
+      });
+      await session.storeSessionMeta();
+      await putOwnerRecord(directory, {
+        executionId: "exec_self_route",
+        owner: { sessionId: "session-b" },
+      });
+      const info = vi.spyOn(console, "info");
+
+      await session.resumeViaModelTool("exec_self_route", approval);
+
+      expect(routeLines(info)).toEqual([
+        expect.objectContaining({
+          executionId: "exec_self_route",
+          path: "same_session",
+          answer: "execution_expired",
+        }),
+      ]);
+    });
+
+    it("logs a resume answered inside the owning session", async () => {
+      const { namespace } = makeDirectory();
+      const session = new HarnessSession({
+        sessionId: "session-a",
+        engine: makeEngine(() => null).engine,
+        directoryNamespace: namespace,
+      });
+      const info = vi.spyOn(console, "info");
+
+      await session.reportResumeAnswered("exec_local", "local", "completed");
+
+      expect(routeLines(info)).toEqual([
+        expect.objectContaining({
+          executionId: "exec_local",
+          path: "local",
+          answer: "completed",
+        }),
+      ]);
+    });
+  });
+
   describe("logs the real error when a forward to the owner fails", () => {
     class RpcError extends Data.TaggedError("RpcError")<{ readonly message: string }> {}
     class ForwardError extends Data.TaggedError("ForwardError")<{
@@ -980,7 +1093,9 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
   describe("after the client DELETEs the owning session", () => {
     const setup = async (
       resumeMs = 0,
-      live?: { readonly flushMs: number },
+      // `replyMs` is how long a settled reply takes to reach the caller. The
+      // platform holds it until pending storage writes are confirmed.
+      live?: { readonly flushMs: number; readonly replyMs?: number },
       // The owner answers, but its reply never reaches the caller.
       replyFault?: "lost" | "timed_out",
       acceptedResult?: string,
@@ -1006,11 +1121,15 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
           forwardModelResumeToOwner: (route, identity, executionId, response) =>
             Effect.promise(() =>
               Promise.race([
-                mcpSessionStub(sessionNamespace, route.sessionId).resumeExecutionForModel(
-                  executionId,
-                  identity,
-                  response,
-                ),
+                mcpSessionStub(sessionNamespace, route.sessionId)
+                  .resumeExecutionForModel(executionId, identity, response)
+                  .then(
+                    (reply) =>
+                      new Promise<McpSessionModelResumeResult>((resolve) => {
+                        if (live?.replyMs) setTimeout(() => resolve(reply), live.replyMs);
+                        else resolve(reply);
+                      }),
+                  ),
                 sessions.get(mcpSessionDurableObjectName(route.sessionId))!.aborted(),
               ]),
             ).pipe(
@@ -1040,6 +1159,47 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     };
 
     const decline = { action: "decline" } satisfies ResumeResponse;
+
+    for (const [label, response, result, runs] of [
+      ["a decline", decline, "declined", 0],
+      ["an approval", approval, "owner-result", 1],
+    ] as const) {
+      it(`keeps the owner alive until the reply to ${label} has reached the caller`, async () => {
+        // No span flush: the RPC settles at once, as on host-cloudflare, and the
+        // reply then takes 20ms to get out.
+        const { owner, sessionA, sessionB } = await setup(0, { flushMs: 0, replyMs: 20 });
+        const info = vi.spyOn(console, "info");
+        const errors = vi.spyOn(console, "error");
+
+        const outcome = sessionB.resumeViaModelTool("exec_owner", response);
+        await vi.advanceTimersByTimeAsync(1000);
+
+        expect(await outcome).toMatchObject(settledWith(result));
+        expect(owner.sideEffects()).toBe(runs);
+        expect(loggedEvents(errors, "mcp_model_resume_forward_error")).toEqual([]);
+        expect(loggedEvents(info, "mcp_model_resume_route")).toEqual([
+          expect.objectContaining({ path: "forward", replayedResult: false }),
+        ]);
+        // The session goes away once the grace period ends.
+        expect(await sessionA.storedSessionMeta()).toBeDefined();
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(await sessionA.storedSessionMeta()).toBeUndefined();
+      });
+    }
+
+    it("does not let an SDK alarm re-arm cut the reply's grace period short", async () => {
+      const { sessionA, sessionB } = await setup(0, { flushMs: 0, replyMs: 20 });
+      const outcome = sessionB.resumeViaModelTool("exec_owner", decline);
+      await vi.advanceTimersByTimeAsync(100);
+      await outcome;
+
+      await sessionA.sdkRearmsAlarmNow();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await sessionA.storedSessionMeta()).toBeDefined();
+
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(await sessionA.storedSessionMeta()).toBeUndefined();
+    });
 
     it("does not store a result too large to replay, and answers already settled", async () => {
       const large = "x".repeat(70 * 1024);
@@ -1133,7 +1293,7 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
         const { owner, sessionA, sessionB, newSession } = await setup(0, { flushMs: 50 });
 
         const outcome = sessionB.resumeViaModelTool("exec_owner", response);
-        await vi.advanceTimersByTimeAsync(1000);
+        await vi.advanceTimersByTimeAsync(6000);
 
         expect(await outcome).toMatchObject({
           status: "result",
