@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "@effect/vitest";
 // oxlint-disable-next-line executor/no-vitest-import -- boundary: vi.mock must come from vitest itself for mock hoisting to resolve
 import { vi } from "vitest";
-import { Cause, Effect, Exit, Option, Schema } from "effect";
+import { Cause, Data, Effect, Exit, Option, Schema } from "effect";
 import {
   CurrentOrgWriteAccess,
   FormElicitation,
@@ -910,6 +910,70 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     // A retry is told the same, without forwarding again.
     expect(await sessionB.resumeViaModelTool("exec_throw", approval)).toEqual({
       status: "execution_outcome_unknown",
+    });
+  });
+
+  describe("logs the real error when a forward to the owner fails", () => {
+    class RpcError extends Data.TaggedError("RpcError")<{ readonly message: string }> {}
+    class ForwardError extends Data.TaggedError("ForwardError")<{
+      readonly cause: unknown;
+      readonly status: number;
+      readonly body: string;
+    }> {}
+
+    const failForwardWith = async (failure: unknown) => {
+      const { directory, namespace } = makeDirectory();
+      const sessionB = new HarnessSession({
+        sessionId: "session-b",
+        engine: makeEngine(() => null).engine,
+        directoryNamespace: namespace,
+        forwardModelResumeToOwner: () =>
+          Effect.sleep("250 millis").pipe(Effect.andThen(Effect.fail(failure))),
+      });
+      await sessionB.storeSessionMeta();
+      await putOwnerRecord(directory, { executionId: "exec_fail" });
+      const errors = vi.spyOn(console, "error");
+
+      const resuming = sessionB.resumeViaModelTool("exec_fail", approval);
+      await vi.advanceTimersByTimeAsync(250);
+      await resuming;
+      return loggedEvents(errors, "mcp_model_resume_forward_error");
+    };
+
+    it("logs a non-Error failure's text", async () => {
+      expect(await failForwardWith("destroyed")).toEqual([
+        expect.objectContaining({
+          reason: "error",
+          error: "destroyed",
+          errorDetail: { kind: "failure", message: "destroyed" },
+          elapsedMs: 250,
+        }),
+      ]);
+    });
+
+    it("logs a tagged failure's tag, fields, status, body and cause", async () => {
+      const failure = new ForwardError({
+        cause: new RpcError({ message: "Network connection lost" }),
+        status: 503,
+        body: "upstream unavailable",
+      });
+
+      expect(await failForwardWith(failure)).toEqual([
+        expect.objectContaining({
+          error: "ForwardError (HTTP 503) <- RpcError: Network connection lost",
+          errorDetail: expect.objectContaining({
+            kind: "failure",
+            tag: "ForwardError",
+            status: 503,
+            body: "upstream unavailable",
+            cause: expect.objectContaining({
+              tag: "RpcError",
+              message: "Network connection lost",
+            }),
+          }),
+          elapsedMs: 250,
+        }),
+      ]);
     });
   });
 
