@@ -63,6 +63,7 @@ class McpExecutionOwnerDirectoryRpcError extends Data.TaggedError(
 }> {}
 
 const RECORD_KEY = "owner";
+const DIRECTORY_CALL_TIMEOUT_MS = 5_000;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -155,21 +156,21 @@ export const mcpExecutionOwnerDirectoryFromNamespace = <Id>(
   if (!namespace) return null;
   const stubFor = (executionId: string): McpExecutionOwnerDirectoryStub =>
     toMcpExecutionOwnerDirectoryStub(namespace.get(namespace.idFromName(executionId)));
+  // Every caller handles a failed call, and none can answer a client while one
+  // of these is stuck, so a stalled directory fails rather than hangs them.
+  const bounded = <A>(call: () => Promise<A>): Effect.Effect<A, unknown> =>
+    Effect.tryPromise({
+      try: call,
+      catch: (cause) => new McpExecutionOwnerDirectoryRpcError({ cause }),
+    }).pipe(
+      Effect.timeoutOrElse({
+        duration: `${DIRECTORY_CALL_TIMEOUT_MS} millis`,
+        orElse: () => Effect.fail(new McpExecutionOwnerDirectoryRpcError({ cause: "timed out" })),
+      }),
+    );
   return {
-    put: (record) =>
-      Effect.tryPromise({
-        try: () => stubFor(record.executionId).put(record),
-        catch: (cause) => new McpExecutionOwnerDirectoryRpcError({ cause }),
-      }),
-    get: (executionId) =>
-      Effect.tryPromise({
-        try: () => stubFor(executionId).get(executionId),
-        catch: (cause) => new McpExecutionOwnerDirectoryRpcError({ cause }),
-      }),
-    delete: (executionId) =>
-      Effect.tryPromise({
-        try: () => stubFor(executionId).delete(executionId),
-        catch: (cause) => new McpExecutionOwnerDirectoryRpcError({ cause }),
-      }),
+    put: (record) => bounded(() => stubFor(record.executionId).put(record)),
+    get: (executionId) => bounded(() => stubFor(executionId).get(executionId)),
+    delete: (executionId) => bounded(() => stubFor(executionId).delete(executionId)),
   };
 };

@@ -882,6 +882,33 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
     expect(sessionA.activeKeepAlives).toBe(0);
   });
 
+  it("fails the pause, holding no lease, when the owner record write hangs", async () => {
+    const hungDirectory: McpExecutionOwnerDirectoryNamespace<string> = {
+      idFromName: (name) => name,
+      get: () => ({
+        put: () => new Promise(() => undefined),
+        get: () => Promise.resolve(null),
+        delete: () => Promise.resolve(),
+      }),
+    };
+    const sessionA = new HarnessSession({
+      sessionId: "session-a",
+      engine: makeEngine(() => null).engine,
+      directoryNamespace: hungDirectory,
+    });
+    await sessionA.storeSessionMeta();
+
+    const pausing = Effect.runPromiseExit(
+      Effect.tryPromise(() => sessionA.startPause("exec_hung")),
+    );
+    // Well inside the 60s after which MCP clients give up.
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    expect(Exit.isFailure(await pausing)).toBe(true);
+    expect(sessionA.pendingLeaseCount()).toBe(0);
+    expect(sessionA.activeKeepAlives).toBe(0);
+  });
+
   it("answers a slow owner session forward as outcome unknown and keeps the record", async () => {
     const { directory, namespace } = makeDirectory();
     const requesterEngine = makeEngine(() => null);
