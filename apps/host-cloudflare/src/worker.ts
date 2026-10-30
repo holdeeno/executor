@@ -1,9 +1,13 @@
+import { Effect, Result } from "effect";
+
 import { makeCloudflareApp } from "./app";
 import {
   cloudflareAccessConfigErrorMessage,
   missingCloudflareAccessVars,
   type CloudflareEnv,
 } from "./config";
+import { makeHandlerResolver } from "./handler-init";
+import { makeMcpRequestTimer, stageStalledResponse, type McpRequestTimer } from "./mcp/post-timing";
 import { mcpResourceFromPath } from "./mcp/resource";
 
 // The MCP Durable Object classes, bound in wrangler.jsonc. They must be exported
@@ -17,20 +21,36 @@ export { McpExecutionOwnerDirectoryDO, McpSessionDO } from "./mcp";
 // authenticated session props into the hibernatable Durable Object bridge.
 // ---------------------------------------------------------------------------
 
-let handlerPromise: Promise<{
+type WorkerHandler = {
   readonly app: (request: Request) => Promise<Response>;
-  readonly mcp: (request: Request, env: CloudflareEnv, ctx: ExecutionContext) => Promise<Response>;
-}> | null = null;
+  readonly mcp: (
+    request: Request,
+    env: CloudflareEnv,
+    ctx: ExecutionContext,
+    timer: McpRequestTimer,
+  ) => Promise<Response>;
+};
+
+let resolver: ReturnType<typeof makeHandlerResolver<WorkerHandler>> | null = null;
 
 const resolveHandler = (env: CloudflareEnv) => {
-  if (!handlerPromise) {
-    handlerPromise = makeCloudflareApp(env).then(({ toWebHandler, mcpAgentHandler }) => ({
+  resolver ??= makeHandlerResolver<WorkerHandler>(() =>
+    makeCloudflareApp(env).then(({ toWebHandler, mcpAgentHandler }) => ({
       app: toWebHandler().handler,
       mcp: mcpAgentHandler,
-    }));
-  }
-  return handlerPromise;
+    })),
+  );
+  return resolver();
 };
+
+const startupStalledResponse = (): Response =>
+  new Response("The service is still starting. Retry the request.\n", {
+    status: 503,
+    headers: {
+      "cache-control": "no-store",
+      "content-type": "text/plain; charset=utf-8",
+    },
+  });
 
 const accessConfigErrorResponse = (missingVars: readonly string[]): Response =>
   new Response(`${cloudflareAccessConfigErrorMessage(missingVars)}\n`, {
@@ -48,11 +68,26 @@ export default {
       return accessConfigErrorResponse(missingAccessVars);
     }
 
-    const serve = await resolveHandler(env);
     const resource = mcpResourceFromPath(new URL(request.url).pathname);
-    if (resource !== null) {
-      return serve.mcp(request, env, ctx);
+    const timer = makeMcpRequestTimer(request);
+    const resolved = await timer.run(
+      "handler_init",
+      resolveHandler(env).pipe(
+        Effect.tapError(() =>
+          Effect.sync(() => {
+            console.error(JSON.stringify({ event: "worker_handler_init_failed" }));
+          }),
+        ),
+      ),
+    );
+    if (Result.isFailure(resolved)) {
+      if (resource === null) return startupStalledResponse();
+      timer.finish();
+      return stageStalledResponse("handler_init");
     }
-    return serve.app(request);
+    if (resource !== null) {
+      return resolved.success.mcp(request, env, ctx, timer);
+    }
+    return resolved.success.app(request);
   },
 };

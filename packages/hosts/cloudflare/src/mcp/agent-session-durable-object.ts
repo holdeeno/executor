@@ -33,6 +33,7 @@ import {
 } from "@executor-js/sdk";
 
 import type { IncomingPropagationHeaders, McpElicitationMode } from "./do-headers";
+import { describeCause, summarizeErrorDetail } from "./describe-error";
 import { classifyDurableObjectError, type DurableObjectFailure } from "./durable-object-errors";
 import type {
   McpExecutionOwnerDirectory,
@@ -289,6 +290,14 @@ const answerFromOwnerRecord = (record: McpExecutionOwnerRecord): ResumeFallbackO
   if (record.outcome === "unknown") return { status: "execution_outcome_unknown" };
   return null;
 };
+/**
+ * How long a DELETEd session stays up after its last approval RPC settles. A
+ * settled RPC has not reached its caller yet: the platform holds the reply
+ * until pending storage writes are confirmed, and aborting the object first
+ * loses it. A time bound, because nothing confirms delivery; if it is still
+ * too short, the caller replays the stored result instead.
+ */
+const DESTROY_GRACE_AFTER_REQUEST_MS = 5_000;
 /** Floor for the closed-session alarm, so it can never re-arm in a hot loop. */
 const CLOSED_SESSION_MIN_RECHECK_MS = 1000;
 const approvalResponseKey = (executionId: string) => `approval-response:${executionId}`;
@@ -445,6 +454,8 @@ export abstract class McpAgentSessionDOBase<
   private pendingApprovalLeases = new Map<string, PendingApprovalLease>();
   /** Approval RPCs still running here, until their result is handed back. */
   private requestsInFlight = 0;
+  /** A DELETE-deferred destroy waits until then for the last reply to get out. */
+  private destroyNotBeforeMs = 0;
 
   protected abstract openSessionDb(): TDbHandle | Promise<TDbHandle>;
 
@@ -712,8 +723,28 @@ export abstract class McpAgentSessionDOBase<
     // session right after that answer, and a teardown cancels queued work.
     onExecutionPaused: (executionId, deadline) =>
       this.startPendingApprovalLease(executionId, deadline),
-    onResumeStarted: (executionId) => this.beginPendingApprovalResume(executionId),
+    // Paired with the route line: a start with no route never got an answer,
+    // and no start at all means the call never reached this tool.
+    onResumeStarted: (executionId) =>
+      Effect.sync(() => {
+        console.info(
+          JSON.stringify({
+            event: "mcp_model_resume_start",
+            executionId,
+            sessionId: this.sessionIdForTelemetry(),
+          }),
+        );
+      }).pipe(Effect.andThen(this.beginPendingApprovalResume(executionId))),
     onResumeSettled: (executionId, result) => this.finishPendingApprovalResume(executionId, result),
+    onResumeAnswered: (executionId, path, answer) =>
+      Effect.sync(() => {
+        this.logModelResumeRoute(
+          { executionId, ownerSessionId: this.sessionIdForTelemetry() },
+          path,
+          answer,
+          undefined,
+        );
+      }),
   };
 
   override async onConnect(conn: Connection, context: ConnectionContext): Promise<void> {
@@ -1302,14 +1333,18 @@ export abstract class McpAgentSessionDOBase<
     readonly executionId: string;
     readonly owner: McpExecutionOwnerRoute;
     readonly cause: Cause.Cause<unknown>;
+    readonly elapsedMs: number;
   }): Effect.Effect<void> {
     const self = this;
     return Effect.gen(function* () {
+      const errorDetail = describeCause(input.cause);
       console.error(
         JSON.stringify({
           event: "mcp_model_resume_forward_error",
           reason: "error",
-          error: Cause.prettyErrors(input.cause)[0]?.message ?? "unknown",
+          error: summarizeErrorDetail(errorDetail),
+          errorDetail,
+          elapsedMs: input.elapsedMs,
           executionId: input.executionId,
           sessionId: self.sessionIdForTelemetry(),
           ownerSessionId: input.owner.sessionId,
@@ -1911,7 +1946,8 @@ export abstract class McpAgentSessionDOBase<
    * flush included). A DELETE-condemned session's alarm will not destroy it
    * meanwhile: the destroy aborts the isolate, and a forwarded resume would
    * lose its result after the call already ran. When the last one finishes on
-   * a condemned session, the alarm is re-armed so the destroy runs right after.
+   * a condemned session, the alarm is re-armed for the end of a grace period
+   * (`DESTROY_GRACE_AFTER_REQUEST_MS`), so the reply gets out first.
    */
   private servingRequest<A>(run: () => Promise<A>): Promise<A> {
     this.requestsInFlight += 1;
@@ -1926,10 +1962,12 @@ export abstract class McpAgentSessionDOBase<
     this.requestsInFlight -= 1;
     if (this.requestsInFlight > 0) return Promise.resolve();
     const self = this;
+    const destroyNotBeforeMs = Date.now() + DESTROY_GRACE_AFTER_REQUEST_MS;
+    this.destroyNotBeforeMs = destroyNotBeforeMs;
     return Effect.runPromise(
       Effect.gen(function* () {
         if (yield* Effect.promise(() => self.destroyPending())) {
-          yield* Effect.promise(() => self.ctx.storage.setAlarm(Date.now()));
+          yield* Effect.promise(() => self.ctx.storage.setAlarm(destroyNotBeforeMs));
         }
       }).pipe(
         Effect.catchCause(() =>
@@ -1974,7 +2012,9 @@ export abstract class McpAgentSessionDOBase<
     // hold the session open past its approval window.
     // Only leases still waiting on an answer have a deadline: one being
     // resumed must settle, and one being expired is already handled. An
-    // approval RPC still returning holds the destroy too (`servingRequest`).
+    // approval RPC still returning holds the destroy too, and so does the
+    // grace period after the last one (`servingRequest`). The SDK re-arms this
+    // alarm for now whenever a destroy is pending, so the check must live here.
     if (await this.destroyPending()) {
       const waiting = () =>
         Array.from(this.pendingApprovalLeases).filter(
@@ -1987,12 +2027,17 @@ export abstract class McpAgentSessionDOBase<
       await Effect.runPromise(
         Effect.forEach(overdue, (executionId) => this.expirePendingApprovalReported(executionId)),
       );
-      if (this.pendingApprovalLeases.size > 0 || this.requestsInFlight > 0) {
+      if (
+        this.pendingApprovalLeases.size > 0 ||
+        this.requestsInFlight > 0 ||
+        Date.now() < this.destroyNotBeforeMs
+      ) {
         // A lease still overdue after expiry ran is not a reason to wake early.
         const later = Date.now();
-        const upcoming = waiting()
-          .map(([, lease]) => lease.expiresAtMs)
-          .filter((expiresAtMs) => expiresAtMs > later);
+        const upcoming = [
+          ...waiting().map(([, lease]) => lease.expiresAtMs),
+          this.destroyNotBeforeMs,
+        ].filter((atMs) => atMs > later);
         const nextMs = Math.min(later + CLOSED_SESSION_LEASE_RECHECK_MS, ...upcoming);
         await this.ctx.storage.setAlarm(Math.max(later + CLOSED_SESSION_MIN_RECHECK_MS, nextMs));
         return;
@@ -2176,8 +2221,17 @@ export abstract class McpAgentSessionDOBase<
     response: ResumeResponse,
   ): Effect.Effect<ResumeFallbackOutcome | null> {
     const directory = this.executionOwnerDirectory();
-    if (!directory) return Effect.succeed(null);
     const self = this;
+    const noRecord = Effect.sync(() => {
+      self.logModelResumeRoute(
+        { executionId, ownerSessionId: null },
+        "no_record",
+        "execution_not_found",
+        undefined,
+      );
+      return null;
+    });
+    if (!directory) return noRecord;
     return Effect.gen(function* () {
       const record = yield* directory.get(executionId).pipe(
         Effect.tapCause((cause) =>
@@ -2185,10 +2239,15 @@ export abstract class McpAgentSessionDOBase<
         ),
         Effect.catchCause(() => Effect.succeed(null)),
       );
-      if (!record) return null;
+      if (!record) return yield* noRecord;
+      const route = { executionId, ownerSessionId: record.owner.sessionId };
 
+      const forbidden = Effect.sync(() => {
+        self.logModelResumeRoute(route, "forbidden", "execution_forbidden", record.outcome);
+        return { status: "execution_forbidden" } as const;
+      });
       const sessionMeta = yield* self.loadSessionMeta();
-      if (!sessionMeta) return { status: "execution_forbidden" } as const;
+      if (!sessionMeta) return yield* forbidden;
       const identity: McpModelResumeCaller = {
         accountId: sessionMeta.userId,
         organizationId: sessionMeta.organizationId,
@@ -2198,22 +2257,24 @@ export abstract class McpAgentSessionDOBase<
         identity.accountId !== record.accountId ||
         identity.organizationId !== record.organizationId
       ) {
-        return { status: "execution_forbidden" } as const;
+        return yield* forbidden;
       }
 
       // The pause already stopped waiting (and the owner may since have been
       // destroyed). Answer from the record; never run the paused call twice.
       const recorded = answerFromOwnerRecord(record);
       if (recorded) {
-        self.logModelResumeRoute(record, "owner_record", recorded, record.outcome);
+        self.logModelResumeRoute(route, "owner_record", recorded.status, record.outcome);
         return recorded;
       }
 
       if (self.sameExecutionOwnerRoute(record.owner, self.executionOwnerRoute())) {
+        self.logModelResumeRoute(route, "same_session", "execution_expired", record.outcome);
         yield* self.deleteExecutionOwnerEntry(executionId);
         return { status: "execution_expired", ttlMs: record.ttlMs } as const;
       }
 
+      const forwardStartedAt = Date.now();
       const forwarded = yield* self
         .forwardModelResumeToOwner(record.owner, identity, executionId, response)
         .pipe(
@@ -2230,15 +2291,31 @@ export abstract class McpAgentSessionDOBase<
           }),
           Effect.catchCause((cause) =>
             self
-              .logModelResumeForwardFailure({ executionId, owner: record.owner, cause })
+              .logModelResumeForwardFailure({
+                executionId,
+                owner: record.owner,
+                cause,
+                elapsedMs: Date.now() - forwardStartedAt,
+              })
               .pipe(Effect.as(null)),
           ),
         );
       if (!forwarded) return yield* self.answerAfterLostForward(record);
-      self.logModelResumeRoute(record, "forward", forwarded, record.outcome);
       if (forwarded.status === "execution_expired" || forwarded.status === "execution_not_found") {
+        // A stale forward can land on a destroyed owner, which knows nothing.
+        // If the record has since ended, it has the real answer.
+        const current = yield* directory
+          .get(executionId)
+          .pipe(Effect.catchCause(() => Effect.succeed(null)));
+        const ended =
+          current?.outcome === "resuming" ? null : current && answerFromOwnerRecord(current);
+        if (ended) {
+          self.logModelResumeRoute(route, "owner_record", ended.status, current?.outcome);
+          return ended;
+        }
         yield* self.deleteExecutionOwnerEntry(executionId);
       }
+      self.logModelResumeRoute(route, "forward", forwarded.status, record.outcome);
       return forwarded.status === "execution_not_found"
         ? ({ status: "execution_expired", ttlMs: record.ttlMs } as const)
         : forwarded;
@@ -2275,32 +2352,46 @@ export abstract class McpAgentSessionDOBase<
       const answer = (held && answerFromOwnerRecord(held)) ?? {
         status: "execution_outcome_unknown" as const,
       };
-      self.logModelResumeRoute(record, "lost_forward", answer, held?.outcome);
+      self.logModelResumeRoute(
+        { executionId: record.executionId, ownerSessionId: record.owner.sessionId },
+        "lost_forward",
+        answer.status,
+        held?.outcome,
+      );
       return answer;
     });
   }
 
   /**
-   * One line per cross-session resume, naming the path it took, so a live
-   * test can follow it: answered from the owner record, by the owner over a
-   * forward, or from the record after the forward was lost.
+   * One line for every model resume, naming the path it took, so a live test
+   * can follow it: answered in this session (`local`, `local_settled`), from
+   * the owner record, by the owner over a forward, from the record after the
+   * forward was lost, or refused (`no_record`, `forbidden`, `same_session`).
    */
   private logModelResumeRoute(
-    record: McpExecutionOwnerRecord,
-    path: "owner_record" | "forward" | "lost_forward",
-    answer: ResumeFallbackOutcome,
+    route: { readonly executionId: string; readonly ownerSessionId: string | null },
+    path:
+      | "local"
+      | "local_settled"
+      | "no_record"
+      | "forbidden"
+      | "same_session"
+      | "owner_record"
+      | "forward"
+      | "lost_forward",
+    answer: string,
     recordOutcome: McpExecutionOwnerOutcome | undefined,
   ): void {
     console.info(
       JSON.stringify({
         event: "mcp_model_resume_route",
-        executionId: record.executionId,
+        executionId: route.executionId,
         sessionId: this.sessionIdForTelemetry(),
-        ownerSessionId: record.owner.sessionId,
+        ownerSessionId: route.ownerSessionId,
         path,
         recordOutcome: recordOutcome ?? null,
-        answer: answer.status,
-        replayedResult: path !== "forward" && answer.status === "result",
+        answer,
+        replayedResult: (path === "owner_record" || path === "lost_forward") && answer === "result",
       }),
     );
   }

@@ -1,4 +1,4 @@
-import { Effect, Predicate } from "effect";
+import { Effect, Predicate, Result } from "effect";
 
 import {
   McpAuthProvider,
@@ -23,8 +23,15 @@ import { mcpSessionStub } from "@executor-js/cloudflare/mcp/session-stub";
 
 import type { CloudflareConfig, CloudflareEnv } from "../config";
 import { cloudflareAccessMcpAuth } from "./auth";
+import { makeMcpRequestTimer, stageStalledResponse, type McpRequestTimer } from "./post-timing";
 import { mcpResourceFromPath } from "./resource";
 import { McpSessionDO } from "./session-durable-object";
+
+// Bounds on the waits before the session hand-off, all well inside the 60s after
+// which MCP clients give up. Nothing has run yet at these stages, so a client can
+// safely retry. Access verify covers jose's own 5s limit on the certs fetch.
+const ACCESS_VERIFY_TIMEOUT_MS = 10_000;
+const SESSION_LOOKUP_TIMEOUT_MS = 30_000;
 
 const corsPreflightResponse = (): Response =>
   new Response(null, {
@@ -105,11 +112,26 @@ export const makeCloudflareMcpAgentHandler = (config: CloudflareConfig) => {
   const serveDefault = McpSessionDO.serve("/mcp", serveOptions);
   const serveToolkit = McpSessionDO.serve("/mcp/toolkits/:slug", serveOptions);
 
-  return async (request: Request, env: CloudflareEnv, ctx: ExecutionContext): Promise<Response> => {
+  return async (
+    request: Request,
+    env: CloudflareEnv,
+    ctx: ExecutionContext,
+    timer: McpRequestTimer = makeMcpRequestTimer(request),
+  ): Promise<Response> => {
     if (request.method === "OPTIONS") return corsPreflightResponse();
     const sessionId = request.headers.get("mcp-session-id");
+    const finished = (response: Response): Response => {
+      timer.finish();
+      return response;
+    };
 
-    const { auth, outcome } = await Effect.runPromise(authenticate(request, config));
+    const verified = await timer.run(
+      "access_verify",
+      authenticate(request, config),
+      ACCESS_VERIFY_TIMEOUT_MS,
+    );
+    if (Result.isFailure(verified)) return finished(stageStalledResponse("access_verify"));
+    const { auth, outcome } = verified.success;
     if (!Predicate.isTagged(outcome, "Authenticated")) {
       if (Predicate.isTagged(outcome, "Forbidden") && sessionId) {
         await Effect.runPromise(
@@ -120,36 +142,48 @@ export const makeCloudflareMcpAgentHandler = (config: CloudflareConfig) => {
           ),
         );
       }
-      return renderAuthError(auth, request, outcome);
+      return finished(renderAuthError(auth, request, outcome));
     }
 
     const resource = mcpResourceFromPath(new URL(request.url).pathname);
     if (resource === null) {
-      return jsonRpcResponse(404, -32001, "MCP route not found");
+      return finished(jsonRpcResponse(404, -32001, "MCP route not found"));
     }
 
     if (!sessionId && request.method === "DELETE") {
-      return new Response(null, { status: 204, headers: { "access-control-allow-origin": "*" } });
+      return finished(
+        new Response(null, { status: 204, headers: { "access-control-allow-origin": "*" } }),
+      );
     }
 
     if (sessionId) {
-      const owner = await mcpSessionStub(env.MCP_SESSION, sessionId).validateMcpSessionOwner(
-        {
-          accountId: outcome.principal.accountId,
-          organizationId: outcome.principal.organizationId,
-        },
-        resource,
+      const lookup = await timer.run(
+        "session_lookup",
+        Effect.promise(() =>
+          mcpSessionStub(env.MCP_SESSION, sessionId).validateMcpSessionOwner(
+            {
+              accountId: outcome.principal.accountId,
+              organizationId: outcome.principal.organizationId,
+            },
+            resource,
+          ),
+        ),
+        SESSION_LOOKUP_TIMEOUT_MS,
       );
+      if (Result.isFailure(lookup)) return finished(stageStalledResponse("session_lookup"));
+      const owner = lookup.success;
       if (owner === "not_found") {
-        return jsonRpcResponse(404, -32001, "Session not found");
+        return finished(jsonRpcResponse(404, -32001, "Session not found"));
       }
       if (owner === "terminated") {
         // DELETE-condemned but the deferred destroy alarm hasn't wiped storage
         // yet; the terminated id must read as dead immediately.
-        return jsonRpcResponse(404, -32001, "Session timed out, please reconnect");
+        return finished(jsonRpcResponse(404, -32001, "Session timed out, please reconnect"));
       }
       if (owner === "forbidden") {
-        return jsonRpcResponse(403, -32003, "MCP session does not belong to the current bearer");
+        return finished(
+          jsonRpcResponse(403, -32003, "MCP session does not belong to the current bearer"),
+        );
       }
     }
 
@@ -167,6 +201,14 @@ export const makeCloudflareMcpAgentHandler = (config: CloudflareConfig) => {
       orgWriteAccessForPrincipal(outcome.principal),
     );
     const target = resource.kind === "toolkit" ? serveToolkit : serveDefault;
-    return target.fetch(forwarded, env, ctx);
+    // No timeout: a tool call may already be running behind this hand-off, and
+    // answering the client early could invite it to run the call again.
+    const handedOff = await timer.run(
+      "do_fetch",
+      Effect.promise(() => target.fetch(forwarded, env, ctx)),
+    );
+    timer.finish();
+    if (Result.isFailure(handedOff)) return stageStalledResponse("do_fetch");
+    return timer.watchFirstByte(handedOff.success);
   };
 };
