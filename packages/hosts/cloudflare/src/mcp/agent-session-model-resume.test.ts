@@ -1267,7 +1267,8 @@ describe("McpAgentSessionDOBase cross-session model resume", () => {
         expect(await sessionA.storedSessionMeta()).toBeUndefined();
         release();
         await vi.advanceTimersByTimeAsync(1);
-        await hung;
+        // It answers from the settled record, not with the fresh owner's "expired".
+        expect(await hung).toMatchObject(settledWith("owner-result"));
 
         expect(owner.sideEffects()).toBe(1);
         expect(await Effect.runPromise(directory.get("exec_owner"))).toMatchObject({

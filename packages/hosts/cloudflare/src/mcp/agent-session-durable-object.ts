@@ -2301,10 +2301,21 @@ export abstract class McpAgentSessionDOBase<
           ),
         );
       if (!forwarded) return yield* self.answerAfterLostForward(record);
-      self.logModelResumeRoute(route, "forward", forwarded.status, record.outcome);
       if (forwarded.status === "execution_expired" || forwarded.status === "execution_not_found") {
+        // A stale forward can land on a destroyed owner, which knows nothing.
+        // If the record has since ended, it has the real answer.
+        const current = yield* directory
+          .get(executionId)
+          .pipe(Effect.catchCause(() => Effect.succeed(null)));
+        const ended =
+          current?.outcome === "resuming" ? null : current && answerFromOwnerRecord(current);
+        if (ended) {
+          self.logModelResumeRoute(route, "owner_record", ended.status, current?.outcome);
+          return ended;
+        }
         yield* self.deleteExecutionOwnerEntry(executionId);
       }
+      self.logModelResumeRoute(route, "forward", forwarded.status, record.outcome);
       return forwarded.status === "execution_not_found"
         ? ({ status: "execution_expired", ttlMs: record.ttlMs } as const)
         : forwarded;
